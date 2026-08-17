@@ -1,0 +1,14 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+onlyBuiltDependencies:
+  - esbuild
+  - sharp
+  - unrs-resolver
+ignoredBuiltDependencies:
+  - canvas
+allowBuilds:
+  canvas: true
+  esbuild: true
+  sharp: true
+  unrs-resolver: true

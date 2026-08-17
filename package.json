@@ -1,0 +1,26 @@
+{
+  "name": "easy",
+  "private": true,
+  "version": "0.1.0",
+  "description": "EASY -- AI-powered cross-document engineering review platform (P&ID / H&MB / PFD / spec sheet consistency checking).",
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck"
+  },
+  "devDependencies": {
+    "turbo": "^2.10.9",
+    "typescript": "^5.6.0"
+  },
+  "pnpm": {
+    "comment": "`canvas` is an optionalDependency of pdfjs-dist that we never use -- rendering goes through @napi-rs/canvas (prebuilt) instead. Its node-gyp build fails on Windows without cairo headers, so skip it rather than spend every install on a build that cannot succeed. See apps/worker/src/pdfPolyfills.ts.",
+    "neverBuiltDependencies": [
+      "canvas"
+    ]
+  },
+  "packageManager": "pnpm@11.12.0",
+  "engines": {
+    "node": ">=20"
+  }
+}
