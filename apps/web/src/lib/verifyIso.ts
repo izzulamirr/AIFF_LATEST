@@ -1591,7 +1591,51 @@ export async function loadRoutingAndValveMatch(params: {
 export interface SpoolWeldDetail {
   tagNumber: string;
   weldType: string;
+  size: string | null;
+  // This weld's own row ID in this sheet's printed WELD LIST table, when it
+  // has one -- an explicit, checkable cross-reference (apps/worker/src/
+  // extraction/iso.ts), not just an internal size lookup.
+  weldListId: string | null;
+  // Deterministic cross-check (apps/worker/src/extraction/isoQualityChecks.ts)
+  // -- set when this weld's own matched WELD LIST row (weldListId) disagrees
+  // with what was recorded for the weld itself (size/shop-vs-field), a sign
+  // one of the two readings is wrong. No vision, no API cost.
+  weldListFlag: string | null;
   locationNote: string;
+  // Deterministic geometric cross-check (apps/worker/src/scripts/
+  // applyGeometricWeldFlags.ts) -- set when this weld's leader line, traced
+  // directly from the PDF's own vector geometry, snaps onto a pipe-route
+  // stretch that a geometrically-confirmed field weld shows is NOT the same
+  // stretch as this weld's own recorded spool_no implies. No vision, no API
+  // cost. Unambiguous: a real field weld bounds exactly one spool on each
+  // side, so this can't be a missed valve/flange explaining it away.
+  geometryFlag: string | null;
+  // Softer signal, same script: this weld sits on the same unbroken stretch
+  // of pipe (confirmed by geometry, no field weld anywhere in it) as
+  // another weld recorded under a DIFFERENT spool_no. Unlike geometryFlag,
+  // this one can legitimately be explained by a valve/flange boundary the
+  // geometry doesn't know about yet (not classified) -- worth a look, not
+  // a confirmed error.
+  geometryGroupFlag: string | null;
+  // Set only when applyGeometricWeldFlags.ts auto-corrected spool_no itself
+  // (never invented -- only applied when the rest of this weld's own
+  // unbroken pipe run unanimously agreed on one value). The original value
+  // is preserved here, never silently overwritten and lost.
+  spoolNoCorrectedFrom: string | null;
+  // Set only when location_note's own item-number reference was manually
+  // confirmed wrong against the real drawing (e.g. SW41: extraction said
+  // "item 10 valve", the actual drawing shows item 11) and corrected --
+  // never auto-applied, since item balloon numbers aren't in the PDF's
+  // real text layer (vector glyph outlines only, same limitation as most
+  // dimension values) so geometry can't verify these on its own yet.
+  locationNoteCorrectedFrom: string | null;
+}
+
+export interface ContainerOrientationLeg {
+  axis: "E" | "N" | "EL";
+  containerDim: "length" | "width" | "height";
+  extentMm: number;
+  clearanceMm: number;
 }
 
 export interface SpoolRow {
@@ -1599,8 +1643,151 @@ export interface SpoolRow {
   boundaryNote: string | null;
   boundingBoxMm: number[] | null;
   shippingContainer: string | null;
+  // Which axis to lay along the container's length/width/height for the
+  // best (max-min-clearance) fit -- see apps/worker/src/extraction/
+  // containerFit.ts's own comment. null when oversized or unmeasured.
+  containerOrientation: ContainerOrientationLeg[] | null;
+  // Deterministic cross-check (apps/worker/src/extraction/iso.ts's
+  // boundaryNoteLooksBranchBased), not from the model -- set when
+  // boundaryNote itself admits the bounding joints sit on a branch leg,
+  // which means this spool may be a branch cluster that should have been
+  // folded into its main-run spool instead of standing on its own.
+  boundaryFlag: string | null;
   weldRange: string | null;
   welds: SpoolWeldDetail[];
+  dimensions: DimensionRow[];
+}
+
+// What kind of physical feature a dimension's from_ref/to_ref text names --
+// derived purely from the already-extracted text (no re-extraction), so a
+// reviewer can tell at a glance which dimensions bound a VALVE (per the
+// extraction schema's own rule, a dimension reaching a valve stops at its
+// flange FACE, not a centerline the way a fitting does) or a GASKET/flange
+// bolt-up joint (a real spool boundary, per the same domain rules used
+// throughout this document's spool boundary-walk), as opposed to an
+// ordinary weld or in-line fitting (elbow/tee/weldolet).
+export type DimensionRefKind = "valve" | "gasket" | "weld" | "fitting" | "tie-in" | null;
+
+export interface DimensionRow {
+  tagNumber: string;
+  valueMm: string | null;
+  axis: string | null;
+  spoolNo: string | null;
+  fromRef: string | null;
+  toRef: string | null;
+  fromKind: DimensionRefKind;
+  toKind: DimensionRefKind;
+  sourcePage: number | null;
+  // Deterministic cross-check (apps/worker/src/extraction/iso.ts) -- set
+  // when this dimension's own spool_no disagrees with the spool_no already
+  // recorded for a weld its from_ref/to_ref names.
+  spoolFlag: string | null;
+  // Manual, auditable override of the whole dimension's own Type category
+  // (see dimensionKind in the spooling page) for cases neither end's own
+  // ref text can reveal automatically, or actively misleads the automatic
+  // classifier. "weldolet" -- confirmed real case: DIM1-15/DIM1-16 (136mm
+  // each) measure a weldolet's own branch-connection depth, not a plain
+  // pipe run, even though neither ref literally says "weldolet" (their own
+  // text only names the instrument tag and the branch weld, e.g. "BW16 on
+  // 25mm instrument branch"). "pipe" -- forces the generic bucket over an
+  // auto "valve" false positive: confirmed real case, DIM1-7 (15mm) reads
+  // "valve" only because its own from_ref names item 7 (a known valve item)
+  // as a general area landmark ("G9 / item 7"), not because the dimension
+  // actually terminates at that valve's own flange face -- its real
+  // endpoint is a spectacle blind boundary, and the 15mm itself is gasket/
+  // stud-bolt clearance at that joint, not a valve body measurement.
+  // "valve" -- the opposite override, for when classifyDimensionRef's
+  // weld-tag-first priority (below) picks a weld tag over a valve word that
+  // ALSO appears in the same ref text, but this dimension's real terminus
+  // is actually the valve, not that weld: confirmed real case, DIM1-6
+  // (457mm) reads "pipe" because its own from_ref "BW06 / item 7 ball valve
+  // region" contains both BW06 and "ball valve", and the weld-tag-first
+  // rule picks BW06 -- correct for other similarly-shaped refs on this same
+  // sheet, but confirmed wrong here specifically, where BW06 is naming the
+  // general area the valve sits in, not this dimension's own endpoint.
+  manualKind: "weldolet" | "pipe" | "valve" | null;
+}
+
+// A fabrication/cut sheet's own printed CUT PIPE LENGTH table -- the raw
+// pipe stock a spool is built FROM, not the same thing as a DimensionRow
+// (which measures the assembled spool). spoolNo is frequently null since
+// this table is usually printed once for the whole sheet, not per spool
+// (see the extraction schema's own comment on the cut_pieces field).
+export interface CutPieceRow {
+  tagNumber: string;
+  cutLengthMm: string | null;
+  size: string | null;
+  remarks: string | null;
+  end1: string | null;
+  end2: string | null;
+  // Traced from this piece's own printed <N> marker on the drawn route (see
+  // the extraction schema's own comment) to the nearest weld/fitting/tie-in
+  // on each side -- null when the marker couldn't be located.
+  fromRef: string | null;
+  toRef: string | null;
+  spoolNo: string | null;
+  sourcePage: number | null;
+  // A human-confirmed override for the reconciliation match, set when the
+  // automatic matcher (weld tag or shared coordinate token in a dimension's
+  // own end-text) can't safely resolve one end -- e.g. a weld's location_note
+  // citing a dimension's VALUE ("start of the 3437mm run") rather than a tag
+  // or coordinate. Value-citation alone isn't a safe general signal (a weld
+  // sitting midway along a run can cite that run's length too, without being
+  // an endpoint of it -- confirmed this would have hijacked piece 5's correct
+  // match), so it's only trusted here, per-piece, after manual confirmation.
+  manualDimensionMatch: string | null;
+  manualDimensionNote: string | null;
+  // Overrides the elbow count the "elbow"-word-count heuristic would derive
+  // from the matched dimension's own end text. Needed when a boundary weld
+  // sits at a real elbow the dimension's own end-text doesn't literally
+  // name as one (confirmed case: BW11, described only as "midway on
+  // horizontal run", but its own piece's remaining length is exactly 2x the
+  // independently-validated single-elbow constant -- a real second elbow
+  // the text just doesn't call out explicitly).
+  manualElbowCount: 0 | 1 | 2 | null;
+}
+
+// A fabrication/cut sheet's own printed WELD LIST table, captured verbatim
+// so each weld's own weldListId citation can be checked against what the
+// row actually says instead of just trusted (see the extraction schema's
+// own comment on the weld_list field, and computeIsoQualityFlags for the
+// real case -- a continuous table ID sequence spanning both shop and field
+// welds -- that motivated this).
+export interface WeldListRow {
+  id: string;
+  nd: string | null;
+  type: string | null;
+  category: string | null;
+  matchedWeldTag: string | null;
+  status: "verified" | "mismatch" | "unmatched";
+  detail: string | null;
+  sourcePage: number | null;
+}
+
+// A cut piece and a printed dimension can describe the SAME physical span
+// two different ways: the piece as raw straight stock, weld-to-weld; the
+// dimension as an assembled measurement that, per the existing dimension
+// rules, lands on a FITTING'S OWN CENTERLINE when either end is an elbow
+// (not its far weld). When a piece's own two bounding welds match a
+// dimension's own two ends (directly by weld tag, or indirectly because
+// that weld's own location_note names the same fitting/coordinate the
+// dimension references), the difference between the two isn't noise -- it's
+// exactly the fitting take-up length the dimension's centerline convention
+// adds back in. Two elbows (one at each end) split that difference evenly;
+// one elbow attributes all of it to that single end; zero means the gap is
+// just ordinary weld/bevel-prep allowance, not a fitting.
+export interface ReconciliationRow {
+  pieceTag: string;
+  cutLengthMm: number | null;
+  size: string | null;
+  fromRef: string | null;
+  toRef: string | null;
+  matchedDimensionTag: string | null;
+  dimensionValueMm: number | null;
+  remainingMm: number | null;
+  elbowCount: 0 | 1 | 2 | null;
+  perElbowMm: number | null;
+  note: string | null;
 }
 
 export interface SpoolingView {
@@ -1610,6 +1797,93 @@ export interface SpoolingView {
   weldCountsByType: Map<string, number>;
   weldsByType: Map<string, ExtractedTag[]>;
   weldTypesSorted: string[];
+  dimensionRows: DimensionRow[];
+  cutPieceRows: CutPieceRow[];
+  weldListRows: WeldListRow[];
+  reconciliationRows: ReconciliationRow[];
+  // Welds/dimensions whose own spool_no is blank, or set but doesn't match
+  // any spool the extraction actually produced its own tag for -- rendered
+  // nowhere else now that welds/dimensions nest under their spool, so these
+  // exist to keep that gap visible instead of the data silently vanishing.
+  unassignedWelds: SpoolWeldDetail[];
+  unassignedDimensions: DimensionRow[];
+}
+
+// Classifies a dimension's from_ref/to_ref text by what kind of physical
+// feature it names. Priority matters here: a reference commonly mentions
+// several things at once (e.g. "F5 G9 B11 tie-in flange / item 7 region"
+// names both a flange AND a valve) -- valve wins first since it's the
+// domain rule with the sharpest consequence (dimension stops at the flange
+// FACE, not a centerline), then gasket/flange, then a weld tag, then an
+// in-line fitting, then a tie-in/continuation callout. "item N" alone
+// doesn't say what item N IS, so a short document-specific list of this
+// sheet's own known valve item numbers (read off its BOM: item 7 the ball
+// valve, items 13/14/19 the gate valves) backs up the plain "valve" keyword
+// match for references that name the item but not the word.
+const KNOWN_VALVE_ITEM_NUMBERS = new Set(["7", "13", "14", "19"]);
+// A weld tag present ANYWHERE in a ref is checked first, ahead of valve/
+// gasket -- it's the most concrete, unambiguous destination signal (the
+// schema's own rule: "always cite a weld tag... never a fitting's
+// description"), so it overrides any OTHER landmark word also present in
+// the same string. Confirmed real case: "BW06 / item 7 ball valve region"
+// contains both a real weld tag AND the word "valve" together -- this
+// dimension measures to BW06, a weld, with "ball valve region" merely
+// naming the nearby area for orientation, not a real valve boundary.
+function classifyDimensionRef(ref: string | null): DimensionRefKind {
+  if (!ref) return null;
+  if (/\b(BW|SW|FW)\s*0*\d+\b/i.test(ref)) return "weld";
+  if (/\bvalves?\b/i.test(ref)) return "valve";
+  const itemMatch = /\bitem\s*(\d+)\b/i.exec(ref);
+  if (itemMatch && KNOWN_VALVE_ITEM_NUMBERS.has(itemMatch[1])) return "valve";
+  // Require the literal word "gasket"/"flange" -- an "F12 G23 B11"-style
+  // item-balloon code on its own does NOT mean this exact point is a real
+  // gasket/flange boundary; those codes get cited constantly just to name
+  // whatever flange/gasket/bolt items sit nearby, including on ordinary
+  // shop-welded stub flanges well inside a spool (confirmed real case:
+  // "spectacle blind item 8 / F12 G23 B11 joint" is measuring the PIPE RUN
+  // up to that point, not the joint's own length -- matching gasket on the
+  // bare code alone wrongly tagged it "gasket" instead of "pipe").
+  if (/\bgaskets?\b|\bflanges?\b/i.test(ref)) return "gasket";
+  if (/\belbows?\b|\btees?\b|\bweldolets?\b|\breducers?\b/i.test(ref)) return "fitting";
+  if (/\btie-?in\b|\bcont\.?\s*(on|from)\b/i.test(ref)) return "tie-in";
+  return null;
+}
+
+// Cross-end demotion: a "valve" reading on ONE end is downgraded when the
+// OTHER end resolves to a concrete weld tag -- confirmed real case: DIM1-16
+// reads "TT-0003 / G15 B11 / item 14 gate valve" -> "BW18 on 25mm instrument
+// branch". The toRef's own weld tag (BW18) is this dimension's real,
+// unambiguous destination (a weldolet-to-branch-weld span); "item 14 gate
+// valve" in the fromRef only orients WHERE that branch tap-off sits (a
+// different, unrelated valve elsewhere on the line), not what this
+// dimension itself measures to. A genuine weld-to-valve dimension (one
+// truly terminating at a valve's own flange face) hasn't shown a weld tag
+// competing on its OTHER end in any case seen so far -- when it does, the
+// weld tag wins.
+function demoteCrossEndValve(fromKind: DimensionRefKind, toKind: DimensionRefKind): [DimensionRefKind, DimensionRefKind] {
+  const from = fromKind === "valve" && toKind === "weld" ? null : fromKind;
+  const to = toKind === "valve" && fromKind === "weld" ? null : toKind;
+  return [from, to];
+}
+
+function weldTagsIn(s: string | null | undefined): string[] {
+  if (!s) return [];
+  return (s.match(/\b(BW|SW|FW)\s*0*\d+\b/gi) ?? []).map((t) => t.replace(/\s+/g, "").toUpperCase());
+}
+// A printed coordinate signature like "E1725430", "N1208328", "EL+103262"
+// -- shared between a weld's own location_note and a dimension's ref text
+// when both are naming the same fitting, even though the dimension itself
+// never cites a weld tag directly (it names the fitting's own centerline).
+function coordTokensIn(s: string | null | undefined): string[] {
+  if (!s) return [];
+  return (s.match(/\b[EN]\d{6,}\b|\bEL\s*[+-]?\d{5,}\b/gi) ?? []).map((t) => t.replace(/\s+/g, "").toUpperCase());
+}
+function refMatchesEnd(weldTag: string | null, weldLocationNote: string | null, dimEndText: string | null): boolean {
+  if (!weldTag || !dimEndText) return false;
+  if (weldTagsIn(dimEndText).includes(weldTag)) return true;
+  const weldCoords = coordTokensIn(weldLocationNote);
+  const dimCoords = coordTokensIn(dimEndText);
+  return weldCoords.some((c) => dimCoords.includes(c));
 }
 
 // Pipe spools + weld list -- straight off this ISO's own extracted tags, no
@@ -1622,13 +1896,26 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
   // Number(tagNumber) directly yields NaN for the full-string form, which
   // made this order effectively arbitrary instead of ascending.
   function spoolNumberKey(tagNumber: string): string {
-    const m = /-(\d+)$/.exec(tagNumber);
+    // No hyphen requirement -- a weld's own spool_no is always the bare
+    // number, but a dimension's spool_no attribute inconsistently shows up
+    // as "spool 01" (space, not hyphen) as well as bare "02" for the same
+    // document, so this has to catch trailing digits regardless of what
+    // precedes them.
+    const m = /(\d+)\s*$/.exec(tagNumber.trim());
     return m ? m[1] : tagNumber;
   }
   const spoolTags = [...tags.filter((t) => t.tagType === "spool")].sort(
     (a, b) => (a.sourcePage ?? 0) - (b.sourcePage ?? 0) || Number(spoolNumberKey(a.tagNumber)) - Number(spoolNumberKey(b.tagNumber))
   );
   const weldTags = [...tags.filter((t) => t.tagType === "weld")].sort((a, b) => (a.sourcePage ?? 0) - (b.sourcePage ?? 0));
+
+  // Which spool numbers actually exist as their own spool tag -- a weld or
+  // dimension whose own spool_no is blank, OR set but doesn't match any of
+  // these (a typo, or a spool the extraction never produced its own tag
+  // for), has nowhere to nest and would otherwise vanish from the page
+  // entirely now that welds/dimensions render only inside their spool's own
+  // sub-table (see unassignedWelds/unassignedDimensions below).
+  const existingSpoolKeys = new Set(spoolTags.map((t) => spoolNumberKey(t.tagNumber)));
 
   // Collapses a spool's own weld tags into compact ranges (e.g. "SW01-SW06,
   // FW01") instead of listing every single one -- SW and FW are separate
@@ -1676,6 +1963,7 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
   // table can show what each individual weld connects to, not just the
   // compact range.
   const weldDetailsBySpool = new Map<string, SpoolWeldDetail[]>();
+  const unassignedWelds: SpoolWeldDetail[] = [];
   function weldSortKey(tagNumber: string): [string, number] {
     const m = /^([A-Za-z]+)\s*0*(\d+)$/.exec(tagNumber.replace(/\s+/g, ""));
     return m ? [m[1].toUpperCase(), Number(m[2])] : [tagNumber, 0];
@@ -1683,19 +1971,30 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
   for (const t of weldTags) {
     const a = t.attributes as Record<string, unknown>;
     const spoolNo = a.spool_no;
-    if (typeof spoolNo !== "string" || !spoolNo) continue;
+    const detail: SpoolWeldDetail = {
+      tagNumber: t.tagNumber,
+      weldType: typeof a.weld_type === "string" && a.weld_type ? a.weld_type : "-",
+      size: typeof a.size === "string" && a.size ? a.size : null,
+      weldListId: typeof a.weld_list_id === "string" && a.weld_list_id ? a.weld_list_id : null,
+      weldListFlag: typeof a.weld_list_flag === "string" ? a.weld_list_flag : null,
+      locationNote: typeof a.location_note === "string" && a.location_note ? a.location_note : "-",
+      geometryFlag: typeof a.geometry_flag === "string" ? a.geometry_flag : null,
+      geometryGroupFlag: typeof a.geometry_group_flag === "string" ? a.geometry_group_flag : null,
+      spoolNoCorrectedFrom: typeof a.spool_no_corrected_from === "string" ? a.spool_no_corrected_from : null,
+      locationNoteCorrectedFrom: typeof a.location_note_corrected_from === "string" ? a.location_note_corrected_from : null,
+    };
+    if (typeof spoolNo !== "string" || !spoolNo || !existingSpoolKeys.has(spoolNumberKey(spoolNo))) {
+      unassignedWelds.push(detail);
+      continue;
+    }
     const list = weldTagsBySpool.get(spoolNo) ?? [];
     list.push(t.tagNumber);
     weldTagsBySpool.set(spoolNo, list);
     const details = weldDetailsBySpool.get(spoolNo) ?? [];
-    details.push({
-      tagNumber: t.tagNumber,
-      weldType: typeof a.weld_type === "string" && a.weld_type ? a.weld_type : "-",
-      locationNote: typeof a.location_note === "string" && a.location_note ? a.location_note : "-",
-    });
+    details.push(detail);
     weldDetailsBySpool.set(spoolNo, details);
   }
-  for (const details of weldDetailsBySpool.values()) {
+  for (const details of [...weldDetailsBySpool.values(), unassignedWelds]) {
     details.sort((x, y) => {
       const [px, nx] = weldSortKey(x.tagNumber);
       const [py, ny] = weldSortKey(y.tagNumber);
@@ -1710,6 +2009,8 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
     const boundaryNote = a.boundary_note;
     const boundingBoxMm = a.bounding_box_mm;
     const shippingContainer = a.shipping_container;
+    const containerOrientation = a.container_orientation;
+    const boundaryFlag = a.boundary_flag;
     const list = spoolsByPage.get(page) ?? [];
     const key = spoolNumberKey(t.tagNumber);
     const spoolWelds = weldTagsBySpool.get(key);
@@ -1718,8 +2019,11 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
       boundaryNote: typeof boundaryNote === "string" ? boundaryNote : null,
       boundingBoxMm: Array.isArray(boundingBoxMm) ? (boundingBoxMm as number[]) : null,
       shippingContainer: typeof shippingContainer === "string" ? shippingContainer : null,
+      containerOrientation: Array.isArray(containerOrientation) ? (containerOrientation as ContainerOrientationLeg[]) : null,
+      boundaryFlag: typeof boundaryFlag === "string" ? boundaryFlag : null,
       weldRange: spoolWelds && spoolWelds.length > 0 ? compactWeldRanges(spoolWelds) : null,
       welds: weldDetailsBySpool.get(key) ?? [],
+      dimensions: [], // filled in below, once dimensionRows exists
     });
     spoolsByPage.set(page, list);
   }
@@ -1747,5 +2051,177 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
     return ia - ib;
   });
 
-  return { spoolTags, weldTags, spoolsByPage, weldCountsByType, weldsByType, weldTypesSorted };
+  // "DIM1-2" vs "DIM1-10" -- string comparison sorts "-10" before "-2", so
+  // pull the trailing sequence number out and compare numerically instead.
+  function dimSortKey(tagNumber: string): number {
+    const m = /-(\d+)$/.exec(tagNumber);
+    return m ? Number(m[1]) : 0;
+  }
+  const dimensionRows: DimensionRow[] = tags
+    .filter((t) => t.tagType === "dimension")
+    .sort((a, b) => (a.sourcePage ?? 0) - (b.sourcePage ?? 0) || dimSortKey(a.tagNumber) - dimSortKey(b.tagNumber))
+    .map((t) => {
+      const a = t.attributes as Record<string, unknown>;
+      const fromRef = typeof a.from_ref === "string" ? a.from_ref : null;
+      const toRef = typeof a.to_ref === "string" ? a.to_ref : null;
+      const [fromKind, toKind] = demoteCrossEndValve(classifyDimensionRef(fromRef), classifyDimensionRef(toRef));
+      return {
+        tagNumber: t.tagNumber,
+        valueMm: typeof a.value_mm === "string" ? a.value_mm : null,
+        axis: typeof a.axis === "string" ? a.axis : null,
+        spoolNo: typeof a.spool_no === "string" ? a.spool_no : null,
+        fromRef,
+        toRef,
+        fromKind,
+        toKind,
+        sourcePage: t.sourcePage,
+        spoolFlag: typeof a.spool_flag === "string" ? a.spool_flag : null,
+        manualKind:
+          a.manual_kind === "weldolet" ? "weldolet" : a.manual_kind === "pipe" ? "pipe" : a.manual_kind === "valve" ? "valve" : null,
+      };
+    });
+
+  // Nests each dimension under the spool it was assigned to (spoolsByPage's
+  // own rows, built above) so the spooling page can show them directly
+  // under their spool instead of as a separate flat table -- same
+  // trailing-digit key as weldTagsBySpool/weldDetailsBySpool use, needed
+  // here specifically because a dimension's spool_no is inconsistently
+  // "spool 01" vs bare "02" for the same document (see spoolNumberKey).
+  const dimensionsBySpool = new Map<string, DimensionRow[]>();
+  // Same reasoning as unassignedWelds -- a dimension whose own spool_no is
+  // blank, or doesn't match any spool that actually exists, has nowhere to
+  // nest and would otherwise vanish from the page entirely.
+  const unassignedDimensions: DimensionRow[] = [];
+  for (const d of dimensionRows) {
+    if (!d.spoolNo || !existingSpoolKeys.has(spoolNumberKey(d.spoolNo))) {
+      unassignedDimensions.push(d);
+      continue;
+    }
+    const key = spoolNumberKey(d.spoolNo);
+    const list = dimensionsBySpool.get(key) ?? [];
+    list.push(d);
+    dimensionsBySpool.set(key, list);
+  }
+  for (const spools of spoolsByPage.values()) {
+    for (const s of spools) {
+      s.dimensions = dimensionsBySpool.get(spoolNumberKey(s.spoolNo)) ?? [];
+    }
+  }
+
+  const cutPieceRows: CutPieceRow[] = tags
+    .filter((t) => t.tagType === "cut_piece")
+    .sort((a, b) => (a.sourcePage ?? 0) - (b.sourcePage ?? 0) || Number(a.tagNumber) - Number(b.tagNumber) || a.tagNumber.localeCompare(b.tagNumber))
+    .map((t) => {
+      const a = t.attributes as Record<string, unknown>;
+      return {
+        tagNumber: t.tagNumber,
+        cutLengthMm: typeof a.cut_length_mm === "string" ? a.cut_length_mm : null,
+        size: typeof a.size === "string" ? a.size : null,
+        remarks: typeof a.remarks === "string" ? a.remarks : null,
+        end1: typeof a.end1 === "string" ? a.end1 : null,
+        end2: typeof a.end2 === "string" ? a.end2 : null,
+        fromRef: typeof a.from_ref === "string" ? a.from_ref : null,
+        toRef: typeof a.to_ref === "string" ? a.to_ref : null,
+        spoolNo: typeof a.spool_no === "string" ? a.spool_no : null,
+        sourcePage: t.sourcePage,
+        manualDimensionMatch: typeof a.manual_dimension_match === "string" ? a.manual_dimension_match : null,
+        manualDimensionNote: typeof a.manual_dimension_note === "string" ? a.manual_dimension_note : null,
+        manualElbowCount: a.manual_elbow_count === 0 || a.manual_elbow_count === 1 || a.manual_elbow_count === 2 ? a.manual_elbow_count : null,
+      };
+    });
+
+  const weldListRows: WeldListRow[] = tags
+    .filter((t) => t.tagType === "weld_list_row")
+    .sort((a, b) => (a.sourcePage ?? 0) - (b.sourcePage ?? 0) || Number(a.tagNumber) - Number(b.tagNumber) || a.tagNumber.localeCompare(b.tagNumber))
+    .map((t) => {
+      const a = t.attributes as Record<string, unknown>;
+      const matched = weldTags.find((w) => {
+        const wa = w.attributes as Record<string, unknown>;
+        return typeof wa.weld_list_id === "string" && wa.weld_list_id === t.tagNumber;
+      });
+      const matchedAttrs = matched?.attributes as Record<string, unknown> | undefined;
+      const flag = matchedAttrs && typeof matchedAttrs.weld_list_flag === "string" ? matchedAttrs.weld_list_flag : null;
+      return {
+        id: t.tagNumber,
+        nd: typeof a.nd === "string" ? a.nd : null,
+        type: typeof a.type === "string" ? a.type : null,
+        category: typeof a.category === "string" ? a.category : null,
+        matchedWeldTag: matched?.tagNumber ?? null,
+        status: (!matched ? "unmatched" : flag ? "mismatch" : "verified") as WeldListRow["status"],
+        detail: flag,
+        sourcePage: t.sourcePage,
+      };
+    });
+
+  const weldLocationNoteByTag = new Map(
+    weldTags.map((w) => [w.tagNumber, typeof (w.attributes as Record<string, unknown>).location_note === "string" ? ((w.attributes as Record<string, unknown>).location_note as string) : null])
+  );
+  const reconciliationRows: ReconciliationRow[] = cutPieceRows
+    .filter((p) => p.fromRef && p.toRef && p.cutLengthMm)
+    .map((p) => {
+      const pFromTag = weldTagsIn(p.fromRef)[0] ?? p.fromRef;
+      const pToTag = weldTagsIn(p.toRef)[0] ?? p.toRef;
+      const pFromLoc = weldLocationNoteByTag.get(pFromTag ?? "") ?? null;
+      const pToLoc = weldLocationNoteByTag.get(pToTag ?? "") ?? null;
+
+      // A manual override (see CutPieceRow.manualDimensionMatch) always wins
+      // over the automatic finder below -- it exists precisely for the cases
+      // the automatic tag/coordinate matching can't safely resolve on its own.
+      // "DIM1-12+DIM1-13" chains two dimensions end-to-end (no single printed
+      // dimension spans the piece, but consecutive ones together do) -- summed
+      // value, with the elbow count taken only from the chain's own two OUTER
+      // ends (the shared internal joint between chained dimensions is never a
+      // real boundary of the piece, so it must never be counted).
+      const manualTags = p.manualDimensionMatch ? p.manualDimensionMatch.split("+").map((t) => t.trim()) : null;
+      const match: Pick<DimensionRow, "tagNumber" | "valueMm" | "fromRef" | "toRef"> | undefined = manualTags
+        ? (() => {
+            const rows = manualTags.map((tag) => dimensionRows.find((d) => d.tagNumber === tag)).filter((d): d is DimensionRow => !!d);
+            if (rows.length !== manualTags.length) return undefined;
+            const sum = rows.reduce((acc, d) => acc + (d.valueMm ? Number(d.valueMm) : 0), 0);
+            return { tagNumber: manualTags.join(" + "), valueMm: String(sum), fromRef: rows[0].fromRef, toRef: rows[rows.length - 1].toRef };
+          })()
+        : dimensionRows.find((d) => {
+            if (!d.valueMm) return false;
+            const straight = refMatchesEnd(pFromTag, pFromLoc, d.fromRef) && refMatchesEnd(pToTag, pToLoc, d.toRef);
+            const reversed = refMatchesEnd(pFromTag, pFromLoc, d.toRef) && refMatchesEnd(pToTag, pToLoc, d.fromRef);
+            return straight || reversed;
+          });
+
+      if (!match || !match.valueMm) {
+        return { pieceTag: p.tagNumber, cutLengthMm: Number(p.cutLengthMm), size: p.size, fromRef: p.fromRef, toRef: p.toRef, matchedDimensionTag: null, dimensionValueMm: null, remainingMm: null, elbowCount: null, perElbowMm: null, note: null };
+      }
+      const dimValue = Number(match.valueMm);
+      const cutLength = Number(p.cutLengthMm);
+      const remaining = dimValue - cutLength;
+      const elbowCount =
+        p.manualElbowCount ?? (((/\belbows?\b/i.test(match.fromRef ?? "") ? 1 : 0) + (/\belbows?\b/i.test(match.toRef ?? "") ? 1 : 0)) as 0 | 1 | 2);
+      return {
+        pieceTag: p.tagNumber,
+        cutLengthMm: cutLength,
+        size: p.size,
+        fromRef: p.fromRef,
+        toRef: p.toRef,
+        matchedDimensionTag: match.tagNumber,
+        dimensionValueMm: dimValue,
+        remainingMm: remaining,
+        elbowCount,
+        perElbowMm: elbowCount > 0 ? remaining / elbowCount : null,
+        note: p.manualDimensionNote,
+      };
+    });
+
+  return {
+    spoolTags,
+    weldTags,
+    spoolsByPage,
+    weldCountsByType,
+    weldsByType,
+    weldTypesSorted,
+    dimensionRows,
+    cutPieceRows,
+    weldListRows,
+    reconciliationRows,
+    unassignedWelds,
+    unassignedDimensions,
+  };
 }

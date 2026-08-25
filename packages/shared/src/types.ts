@@ -24,6 +24,16 @@ export type DocType = (typeof DOC_TYPES)[number];
 // come from an ISO's own printed dimension lines (audit data behind each
 // spool's computed length) -- both untagged, keyed by a per-sheet sequence
 // number, each optionally tagged with the spool_no it was attributed to.
+// 'cut_piece' rows come from a fabrication/cut sheet's own printed CUT PIPE
+// LENGTH table (piece number, cut length, size, end preps) -- the raw pipe
+// stock a spool is built FROM, not the same thing as a route dimension
+// (which measures the assembled spool). Untagged, keyed by a per-sheet
+// sequence number, optionally tagged with the spool_no it belongs to.
+// 'weld_list_row' rows come from a fabrication/cut sheet's own printed WELD
+// LIST table (ID, ND/size, Type, Category) -- captured verbatim so a
+// weld's own weld_list_id citation (see 'weld') can be cross-checked
+// against what that row actually says, not just trusted. Keyed by the
+// table's own printed ID.
 export const TAG_TYPES = [
   "line",
   "equipment",
@@ -39,6 +49,8 @@ export const TAG_TYPES = [
   "weld",
   "route_point",
   "dimension",
+  "cut_piece",
+  "weld_list_row",
 ] as const;
 export type TagType = (typeof TAG_TYPES)[number];
 

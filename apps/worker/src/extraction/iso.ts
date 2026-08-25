@@ -2,7 +2,8 @@ import Anthropic from "@anthropic-ai/sdk";
 import {
   LOCATE_ISO_SECTIONS_TOOL,
   ISO_SHEET_TOOL,
-  ISO_SPOOL_TRACKING_TOOL,
+  ISO_SPOOL_WELDS_TOOL,
+  ISO_ROUTE_DIMENSIONS_TOOL,
   buildSystemPrompt,
   buildNumberedText,
   sliceText,
@@ -11,7 +12,11 @@ import {
 import { enrichIsoLineAttrs, normalizeSlope, assignItemSpec, parsePressureRating } from "@easy/shared";
 import { callTool, callWithRetry } from "./claudeClient";
 import { renderPdfPages, renderPdfPageTiles } from "../pdfImages";
+import { extractPageTextPositions, extractPageVectorSegments, type TextPosition, type VectorSegment } from "../pdfVectorGeometry";
+import { classifyPageShapes, computeBoundedGroups, computeWeldSpoolCorrections } from "../pdfShapeClassification";
 import { normalizeCellValue } from "./pll";
+import { computeIsoQualityFlags } from "./isoQualityChecks";
+import { computeContainerFit, normalizeSpoolNo } from "./containerFit";
 import type { DocTypeExtractor, TagDraft } from "./types";
 
 interface LocateIsoResult {
@@ -73,8 +78,15 @@ interface IsoSheetResult {
     weld_tag?: string;
     spool_no?: string;
     weld_type: string;
+    weld_list_id?: string;
     size?: string;
     location_note?: string;
+  }>;
+  weld_list?: Array<{
+    id?: string;
+    nd?: string;
+    type?: string;
+    category?: string;
   }>;
   dimensions?: Array<{
     value_mm: string;
@@ -83,18 +95,37 @@ interface IsoSheetResult {
     to_ref?: string;
     spool_no?: string;
   }>;
+  cut_pieces?: Array<{
+    piece_no?: string;
+    cut_length_mm: string;
+    size?: string;
+    remarks?: string;
+    end1?: string;
+    end2?: string;
+    from_ref?: string;
+    to_ref?: string;
+    spool_no?: string;
+  }>;
 }
 
-// Result of the separate ISO_SPOOL_TRACKING_TOOL call -- merged into
-// IsoSheetResult after both calls for a sheet complete (see the per-sheet
-// loop below). All four fields are schema-required on this tool (an empty
-// array is fine; a missing key is not), so they're non-optional here too.
-interface IsoSpoolTrackingResult {
+// Results of the two calls that replaced the original single
+// "spool tracking" call (see ISO_SPOOL_WELDS_TOOL's own comment for why) --
+// merged into one IsoSpoolTrackingResult-shaped object after both complete
+// for a sheet (see the per-sheet loop below), so every downstream consumer
+// (fit computation, tag creation) is unchanged by the split. Each tool's
+// own fields are schema-required (an empty array is fine; a missing key is
+// not), so they're non-optional here too.
+interface IsoSpoolWeldsResult {
   spools: NonNullable<IsoSheetResult["spools"]>;
-  route_points: NonNullable<IsoSheetResult["route_points"]>;
   welds: NonNullable<IsoSheetResult["welds"]>;
-  dimensions: NonNullable<IsoSheetResult["dimensions"]>;
+  weld_list: NonNullable<IsoSheetResult["weld_list"]>;
 }
+interface IsoRouteDimensionsResult {
+  route_points: NonNullable<IsoSheetResult["route_points"]>;
+  dimensions: NonNullable<IsoSheetResult["dimensions"]>;
+  cut_pieces: NonNullable<IsoSheetResult["cut_pieces"]>;
+}
+type IsoSpoolTrackingResult = IsoSpoolWeldsResult & IsoRouteDimensionsResult;
 
 const SYSTEM_PROMPT = buildSystemPrompt("piping isometric drawing");
 
@@ -102,6 +133,20 @@ function pageRangeToNumbers(range: PageRange): number[] {
   const numbers: number[] = [];
   for (let n = range.start; n <= range.end; n++) numbers.push(n);
   return numbers;
+}
+
+// The tool schema declares these fields as arrays, but that's a strong hint
+// to the model, not an API-enforced constraint (see callTool's own comment
+// on this) -- a malformed response (e.g. a single object instead of a
+// one-element array) passes the "field is present" check fine and only
+// blows up later on a bare .map()/.forEach()/for-of, crashing the whole
+// extraction with an opaque "X.map is not a function" (confirmed on a real
+// run: spec_breaks came back as something other than an array). Route every
+// array-shaped field from the model through this instead of `?? []` so one
+// malformed field degrades to "treat as empty" rather than failing the
+// entire sheet.
+function asArray<T>(value: T[] | undefined): T[] {
+  return Array.isArray(value) ? value : [];
 }
 
 // Isometric drawings are graphics-heavy CAD exports -- the title block,
@@ -128,6 +173,33 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
   // that's the one reading tiny weld tags and coordinate text.
   const tilesByPage = pdfBuffer ? await renderPdfPageTiles(pdfBuffer, allPageNumbers) : [];
 
+  // Deterministic weld/spool cross-check and correction, layered on top of
+  // Claude's own read below -- confirmed this session (against a real,
+  // vector-CAD-exported ISO) that a weld's diamond symbol, its leader line,
+  // and the real pipe centerline are all literal, computable vector
+  // geometry in this kind of PDF, not something that has to be visually
+  // re-derived. Zero extra API cost. Only ever CORRECTS spool_no when a
+  // weld's own FW-bounded group has a unanimous, independently-clean
+  // consensus to merge into (see computeWeldSpoolCorrections's own
+  // comment) -- it never invents a new spool number, so a genuine
+  // valve/flange split (not yet classified -- see pdfShapeClassification.ts's
+  // own `unclassified` catalog) still surfaces as a flag for a human, not a
+  // guess. Gracefully finds nothing and changes nothing on a scanned/
+  // non-vector PDF (extractPageVectorSegments/text simply return sparse or
+  // empty results for a page with no real vector content), and a failure
+  // here must never fail the extraction itself -- it's a quality layer on
+  // top of Claude's read, not a dependency of it.
+  let geometryTexts: TextPosition[] = [];
+  let geometrySegments: VectorSegment[] = [];
+  if (pdfBuffer) {
+    try {
+      geometryTexts = await extractPageTextPositions(pdfBuffer, allPageNumbers);
+      geometrySegments = await extractPageVectorSegments(pdfBuffer, allPageNumbers);
+    } catch (err) {
+      console.error("[iso] geometric weld/spool cross-check failed to extract vector data, skipping:", err);
+    }
+  }
+
   const locate = await callWithRetry(() =>
     callTool<LocateIsoResult>(client, {
       tool: LOCATE_ISO_SECTIONS_TOOL,
@@ -139,7 +211,8 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
       maxTokens: 8000,
       useThinking: true,
       images: renderedPages.map((r) => r.pngBase64),
-    })
+    }),
+    0
   );
 
   if (!locate.sheets || locate.sheets.length === 0) {
@@ -192,161 +265,120 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
         maxTokens: 32000,
         useThinking: true,
         images: sheetImages,
-      })
+      }),
+      0
     );
 
-    // Separate call, separate token budget -- confirmed on a real run that
-    // packing a full BOM AND spools AND a welds array running into the
+    // Separate calls, separate token budgets -- confirmed on a real run
+    // that packing a full BOM AND spools AND a welds array running into the
     // dozens AND route_points AND dimensions into ONE response ran out of
     // room even at max_tokens=64000, with welds specifically coming back
-    // near-empty on sheets where the BOM alone was already large.
-    const spoolResult = await callWithRetry(async () => {
-      const r = await callTool<IsoSpoolTrackingResult>(client, {
-        tool: ISO_SPOOL_TRACKING_TOOL,
+    // near-empty on sheets where the BOM alone was already large. Further
+    // split into TWO calls (spools+welds, then route_points+dimensions)
+    // after the combined tool's own schema grew to ~9,000 tokens of rules
+    // across this session's accuracy fixes, and a real extraction dropped
+    // ALL FOUR arrays on both the original attempt and its retry -- see
+    // ISO_SPOOL_WELDS_TOOL's own comment. The second call is given the
+    // first call's own spools/welds results as reference text, so dimension
+    // placement can reference ALREADY-SETTLED weld-to-spool assignments
+    // instead of re-deriving spool boundaries independently.
+    const sheetImageArgs = { images: [...sheetImages, ...sheetTiles.map((t) => t.pngBase64)] };
+    const tileExplanation =
+      `This is isometric drawing "${sheet.drawing_number}"${sheet.sheet ? `, sheet ${sheet.sheet}` : ""} -- page ${sheet.pages.start} of the document. The FIRST attached image is the whole sheet -- use it to trace the route and see how everything connects. ` +
+      `The REMAINING ${sheetTiles.length} images are overlapping close-up tiles of that same sheet, in reading order (row 1 left to right, then row 2), each covering about a ${sheetTiles[0]?.cols ?? 3}x${sheetTiles[0]?.rows ?? 2} slice of it at far higher resolution than the whole-sheet image. ` +
+      `Weld tag numbers (SW/FW + digits), E/N/EL coordinate callouts, and printed dimension values are frequently ONLY legible in the tiles -- the whole-sheet image compresses them to a few pixels. Read every weld tag, coordinate, and dimension from the tiles; use the whole-sheet image only to work out spool boundaries and how the route connects. Adjacent tiles OVERLAP, so a mark appearing in two tiles is ONE mark -- do not record it twice. `;
+
+    const spoolWeldsResult = await callWithRetry(async () => {
+      const r = await callTool<IsoSpoolWeldsResult>(client, {
+        tool: ISO_SPOOL_WELDS_TOOL,
         systemPrompt: SYSTEM_PROMPT,
         userText:
-          `${sheetText}\n\nThis is isometric drawing "${sheet.drawing_number}"${sheet.sheet ? `, sheet ${sheet.sheet}` : ""} -- page ${sheet.pages.start} of the document. The FIRST attached image is the whole sheet -- use it to trace the route and see how everything connects. ` +
-          `The REMAINING ${sheetTiles.length} images are overlapping close-up tiles of that same sheet, in reading order (row 1 left to right, then row 2), each covering about a ${sheetTiles[0]?.cols ?? 3}x${sheetTiles[0]?.rows ?? 2} slice of it at far higher resolution than the whole-sheet image. ` +
-          `Weld tag numbers (SW/FW + digits), E/N/EL coordinate callouts, and printed dimension values are frequently ONLY legible in the tiles -- the whole-sheet image compresses them to a few pixels. Read every weld tag, coordinate, and dimension from the tiles; use the whole-sheet image only to work out spool boundaries and how the route connects. Adjacent tiles OVERLAP, so a mark appearing in two tiles is ONE mark -- do not record it twice. ` +
-          `Read the pipe spools, route-point coordinates, welds, and dimensions printed on THIS sheet via the record_iso_spool_tracking tool call -- completeness here (especially the welds array) matters as much as the BOM does.`,
-        maxTokens: 64000,
+          `${sheetText}\n\n${tileExplanation}` +
+          `Read the pipe spools and welds printed on THIS sheet via the record_iso_spool_welds tool call -- completeness here (especially the welds array) matters as much as the BOM does.`,
+        maxTokens: 48000,
         useThinking: true,
-        images: [...sheetImages, ...sheetTiles.map((t) => t.pngBase64)],
+        ...sheetImageArgs,
       });
       // required in the schema is a strong hint to the model, not an
       // API-enforced constraint (this tool isn't strict-mode) -- confirm
-      // the arrays actually came back rather than trusting the schema
-      // alone, and retry the sheet if the model dropped them under
-      // output-token pressure instead of silently persisting partial data.
-      const missing = (["spools", "welds", "route_points", "dimensions"] as const).filter((k) => r[k] === undefined);
+      // the arrays actually came back AS ARRAYS rather than trusting the
+      // schema alone (confirmed on a real run: a 3-spool fabrication sheet
+      // came back with spools as a bare object under output-token
+      // pressure). Fails the sheet outright on a miss rather than
+      // retrying -- a retry re-sends the full image/tile payload and pays
+      // for it again, and this can happen on every sheet of a document.
+      const missing = (["spools", "welds", "weld_list"] as const).filter((k) => !Array.isArray(r[k]));
       if (missing.length > 0) {
-        throw new Error(`record_iso_spool_tracking for ${sheet.drawing_number} sheet ${sheet.sheet ?? "?"} is missing required field(s): ${missing.join(", ")}`);
+        throw new Error(`record_iso_spool_welds for ${sheet.drawing_number} sheet ${sheet.sheet ?? "?"} is missing required array field(s): ${missing.join(", ")}`);
       }
       return r;
-    });
+    }, 0);
+
+    // Reference text for the second call -- see ISO_ROUTE_DIMENSIONS_TOOL's
+    // own comment for why it must use this rather than re-deriving spool
+    // boundaries itself.
+    const spoolsRefText = spoolWeldsResult.spools.map((s) => `spool ${s.spool_no}: ${s.boundary_note ?? "(no boundary note)"}`).join("\n") || "(none)";
+    const weldsRefText =
+      spoolWeldsResult.welds
+        .map((w) => `${w.weld_tag ?? "(untagged)"} -> spool ${w.spool_no ?? "(unassigned)"}${w.location_note ? ` -- ${w.location_note}` : ""}`)
+        .join("\n") || "(none)";
+
+    const routeDimResult = await callWithRetry(async () => {
+      const r = await callTool<IsoRouteDimensionsResult>(client, {
+        tool: ISO_ROUTE_DIMENSIONS_TOOL,
+        systemPrompt: SYSTEM_PROMPT,
+        userText:
+          `${sheetText}\n\n${tileExplanation}` +
+          `This sheet's spools and welds were ALREADY determined by a separate call -- use this as reference, do not re-derive spool boundaries independently:\n\nSPOOLS:\n${spoolsRefText}\n\nWELDS:\n${weldsRefText}\n\n` +
+          `Read the route-point coordinates and dimensions printed on THIS sheet via the record_iso_route_dimensions tool call -- completeness here matters as much as the BOM does.`,
+        maxTokens: 48000,
+        useThinking: true,
+        ...sheetImageArgs,
+      });
+      // Same array-shape check as record_iso_spool_welds above, not just
+      // presence -- see that call's own comment for the real case that
+      // motivated this.
+      const missing = (["route_points", "dimensions", "cut_pieces"] as const).filter((k) => !Array.isArray(r[k]));
+      if (missing.length > 0) {
+        throw new Error(`record_iso_route_dimensions for ${sheet.drawing_number} sheet ${sheet.sheet ?? "?"} is missing required array field(s): ${missing.join(", ")}`);
+      }
+      return r;
+    }, 0);
+
+    const spoolResult: IsoSpoolTrackingResult = { ...spoolWeldsResult, ...routeDimResult };
 
     const result: IsoSheetResult = { ...sheetResult, ...spoolResult };
     allSheets.push({ drawing_number: sheet.drawing_number, pageNumber: sheet.pages.start, result });
     onProgress?.({ phase: "sheet", current: i + 1, total: locatedSheets.length, detail: `${sheet.drawing_number}${sheet.sheet ? ` sheet ${sheet.sheet}` : ""}` });
   }
 
-  // Spool shipping-fit validation -- each spool's real fabricated size,
-  // checked against standard shipping containers' internal envelopes. This
-  // VALIDATES the FW/erection-joint boundaries the drawing itself shows (see
-  // each spool's own boundary_note) -- it never invents or moves a boundary.
-  // A spool that comes back oversized usually means a field weld was missed
-  // during extraction, or is a genuine design issue worth a human look.
-  //
-  // Two independent signals feed the size, kept STRICTLY per axis (E/N/EL) --
-  // an isometric run only ever points along one of three directions, and a
-  // turn through an elbow/tee switches which one, so dimensions either side
-  // of a turn are very likely on DIFFERENT axes. Summing them together (as
-  // an earlier version of this did) produces a number that isn't any real
-  // physical dimension of the spool at all -- e.g. a 1407mm run before a
-  // bend plus a 3437mm run after it are NOT one 4844mm straight length.
-  //  - E/N/EL coordinate spread -> a true per-axis extent, but only as good
-  //    as how many coordinate callouts the sheet happens to print.
-  //  - Printed dimensions, summed WITHIN their own axis only (never across
-  //    axes) -> fills in an axis the coordinate spread missed, or confirms
-  //    it independently when both are present.
-  // Each axis takes whichever of the two signals is bigger for THAT axis
-  // (never the safer-looking smaller one); an axis with neither a
-  // coordinate spread nor any axis-tagged dimension stays at 0 (unmeasured,
-  // not "zero size").
-  const CONTAINERS = [
-    { name: "20ft", internalMm: [5900, 2390, 2350] },
-    { name: "40ft", internalMm: [12032, 2390, 2350] },
-  ] as const;
-  const AXES = ["e", "n", "el"] as const;
-  type Axis = (typeof AXES)[number];
-  function normalizeAxis(raw: string | undefined): Axis | null {
-    const a = raw?.trim().toLowerCase();
-    return a === "e" || a === "n" || a === "el" ? a : null;
-  }
-
-  interface RoutePoint {
-    spoolNo: string;
-    e: number;
-    n: number;
-    el: number;
-  }
-  const routePoints: RoutePoint[] = [];
-  for (const { result } of allSheets) {
-    for (const p of result.route_points ?? []) {
-      const spoolNo = p.spool_no?.trim();
-      const e = Number(p.easting_mm);
-      const northing = Number(p.northing_mm);
-      const el = Number(String(p.elevation_mm ?? "").replace(/^\+/, ""));
-      if (!spoolNo || !Number.isFinite(e) || !Number.isFinite(northing) || !Number.isFinite(el)) continue;
-      routePoints.push({ spoolNo, e, n: northing, el });
-    }
-  }
-  const pointsBySpool = new Map<string, RoutePoint[]>();
-  for (const p of routePoints) {
-    const list = pointsBySpool.get(p.spoolNo) ?? [];
-    list.push(p);
-    pointsBySpool.set(p.spoolNo, list);
-  }
-
-  // Dimension lines per spool, PER AXIS -- read as their own top-level array
-  // (not attached to welds), each tagged with which of the three isometric
-  // directions it runs along. Only dimensions sharing the same axis are
-  // summed together; a dimension with no readable axis contributes to
-  // neither signal for that spool (better an axis stays unmeasured than
-  // guessed wrong).
-  const dimsBySpoolAxis = new Map<string, Map<Axis, number[]>>();
-  for (const { result } of allSheets) {
-    for (const d of result.dimensions ?? []) {
-      const spoolNo = d.spool_no?.trim();
-      const axis = normalizeAxis(d.axis);
-      const value = Number(d.value_mm);
-      if (!spoolNo || !axis || !Number.isFinite(value) || value <= 0) continue;
-      const byAxis = dimsBySpoolAxis.get(spoolNo) ?? new Map<Axis, number[]>();
-      const list = byAxis.get(axis) ?? [];
-      list.push(value);
-      byAxis.set(axis, list);
-      dimsBySpoolAxis.set(spoolNo, byAxis);
-    }
-  }
-
-  const allSpoolNos = new Set([...pointsBySpool.keys(), ...dimsBySpoolAxis.keys()]);
-  const fitBySpool = new Map<
-    string,
-    { boundingBoxMm: [number, number, number]; summedLengthMm: number | null; container: string | null }
-  >();
-  for (const spoolNo of allSpoolNos) {
-    const points = pointsBySpool.get(spoolNo) ?? [];
-    const coordExtent = (vals: number[]) => (vals.length >= 2 ? Math.max(...vals) - Math.min(...vals) : 0);
-    const coordByAxis: Record<Axis, number> = {
-      e: coordExtent(points.map((p) => p.e)),
-      n: coordExtent(points.map((p) => p.n)),
-      el: coordExtent(points.map((p) => p.el)),
-    };
-
-    const dimByAxis = dimsBySpoolAxis.get(spoolNo);
-    const axisTotals = AXES.map((axis) => {
-      const dims = dimByAxis?.get(axis) ?? [];
-      const summed = dims.length > 0 ? dims.reduce((a, b) => a + b, 0) : 0;
-      return Math.max(coordByAxis[axis], summed);
-    });
-    const anyDimSum = dimByAxis ? [...dimByAxis.values()].some((d) => d.length > 0) : false;
-    const summedLengthMm = anyDimSum
-      ? Math.max(...AXES.map((axis) => (dimByAxis?.get(axis) ?? []).reduce((a, b) => a + b, 0)))
-      : null;
-
-    if (points.length < 2 && !anyDimSum) continue; // no size data at all for this spool
-
-    const box = [...axisTotals].sort((a, b) => b - a) as [number, number, number];
-    const container = CONTAINERS.find((c) => box.every((dim, i) => dim <= c.internalMm[i]))?.name ?? "oversized";
-    fitBySpool.set(spoolNo, { boundingBoxMm: box, summedLengthMm, container });
-  }
+  // Spool shipping-fit validation -- see computeContainerFit's own comment
+  // for the full method (coordinate spread vs. per-axis dimension sums, and
+  // why same-endpoint dimensions get deduplicated rather than summed).
+  const fitRoutePoints = allSheets.flatMap(({ result }) =>
+    asArray(result.route_points)
+      .map((p) => {
+        const spoolNo = p.spool_no?.trim();
+        const e = Number(p.easting_mm);
+        const northing = Number(p.northing_mm);
+        const el = Number(String(p.elevation_mm ?? "").replace(/^\+/, ""));
+        if (!spoolNo || !Number.isFinite(e) || !Number.isFinite(northing) || !Number.isFinite(el)) return null;
+        return { spoolNo, e, n: northing, el };
+      })
+      .filter((p): p is NonNullable<typeof p> => p !== null)
+  );
+  const fitDimensions = allSheets.flatMap(({ result }) =>
+    asArray(result.dimensions).map((d) => ({ spoolNo: d.spool_no ?? null, axis: d.axis, valueMm: d.value_mm, fromRef: d.from_ref ?? null, toRef: d.to_ref ?? null }))
+  );
+  const fitWelds = allSheets.flatMap(({ result }) => asArray(result.welds).map((w) => ({ tagNumber: w.weld_tag ?? "", locationNote: w.location_note ?? null })));
+  const fitBySpool = computeContainerFit(fitRoutePoints, fitDimensions, fitWelds);
 
   const tags: TagDraft[] = [];
   const n = normalizeCellValue; // collapse any embedded newlines to " / "
   for (const { drawing_number, pageNumber, result } of allSheets) {
     // Classes present on this sheet, with their pressure class where known --
     // the basis for placing each BOM item when the drawing has a spec break.
-    const specsWithRatings = (result.spec_breaks ?? []).map((b) => ({
+    const specsWithRatings = asArray(result.spec_breaks).map((b) => ({
       spec_class: b.spec_class,
       location_note: b.location_note,
       rating: parsePressureRating(b.rating) ?? (b.rating ? Number(String(b.rating).replace(/\D/g, "")) || null : null),
@@ -398,7 +430,7 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
         }),
       });
     }
-    for (const item of result.bom_items ?? []) {
+    for (const item of asArray(result.bom_items)) {
       tags.push({
         tagType: "bom_item",
         tagNumber: item.item_no,
@@ -438,10 +470,81 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
       });
     }
 
-    for (const spool of result.spools ?? []) {
+    const weldTagNumbers = asArray(result.welds).map((w, i) => n(w.weld_tag) ?? `W${pageNumber}-${i + 1}`);
+    const dimensionTagNumbers = asArray(result.dimensions).map((_d, i) => `DIM${pageNumber}-${i + 1}`);
+    const cutPieceTagNumbers = asArray(result.cut_pieces).map((p, i) => n(p.piece_no) ?? `CUT${pageNumber}-${i + 1}`);
+
+    // Geometric weld/spool cross-check + correction, layered on Claude's own
+    // read above -- see geometryTexts/geometrySegments's own comment for
+    // what this can and can't determine, and computeWeldSpoolCorrections's
+    // own comment for exactly which case it's safe to auto-fix vs. only
+    // flag. A failure or an empty result here (a scanned/non-vector PDF)
+    // must never break extraction -- it's a quality layer on Claude's
+    // output, not a dependency of it. Runs BEFORE the text-based
+    // deterministic cross-checks below (a deliberate reordering -- it used
+    // to run after) so computeIsoQualityFlags sees each weld's
+    // GEOMETRICALLY-CORRECTED spool_no, not Claude's raw pre-correction
+    // read -- the dimension-vs-weld and spool boundary-note checks below
+    // both key off weld spool_no, so checking against stale data meant a
+    // dimension could pass a consistency check against a weld number that
+    // was already known to be wrong.
+    let weldCorrectionByTag = new Map<string, { newSpoolNo: string; oldSpoolNo: string }>();
+    let weldHardFlagByTag = new Map<string, string>();
+    let weldGroupFlagByTag = new Map<string, string>();
+    let weldTypeByGeometricTag = new Map<string, "shop weld" | "field weld" | "unknown">();
+    if (geometryTexts.length > 0 || geometrySegments.length > 0) {
+      try {
+        const geometryShapes = classifyPageShapes(pageNumber, geometrySegments, geometryTexts);
+        const boundedGroups = computeBoundedGroups(geometryShapes);
+        const rawSpoolByTag = new Map(asArray(result.welds).map((w, i) => [weldTagNumbers[i].toUpperCase(), n(w.spool_no) ?? undefined]));
+        const corrections = computeWeldSpoolCorrections(geometryShapes, boundedGroups, rawSpoolByTag);
+        weldCorrectionByTag = corrections.correctionByTag;
+        weldHardFlagByTag = corrections.hardFlagByTag;
+        weldGroupFlagByTag = corrections.groupFlagByTag;
+        weldTypeByGeometricTag = new Map(geometryShapes.welds.map((w) => [w.tagNumber, w.weldType]));
+      } catch (err) {
+        console.error(`[iso] geometric weld/spool cross-check failed for page ${pageNumber}, skipping:`, err);
+      }
+    }
+
+    // Deterministic cross-checks below run against the model's OWN already-
+    // extracted output -- no second API call, no re-examining the image,
+    // zero extra token cost. Cheaper than a review pass because they only
+    // catch what's checkable from the data alone (internal contradictions,
+    // mismatched cross-references, missing sequence numbers); anything that
+    // actually requires re-reading the drawing (e.g. confirming which side
+    // of a valve a weld is really on) still needs a human or a real re-check.
+    // Shared with recheckIsoQualityFlags (isoQualityChecks.ts) so the exact
+    // same logic can be re-run against data already sitting in the database
+    // -- no new extraction -- if these checks are ever updated after the
+    // fact (see that function's own comment for why that matters).
+    const { spoolFlags, dimensionFlags, weldListFlags } = computeIsoQualityFlags(
+      asArray(result.spools)
+        .map((s) => ({ tagNumber: n(s.spool_no) ?? "", boundaryNote: n(s.boundary_note) ?? null }))
+        .filter((s) => s.tagNumber),
+      asArray(result.welds).map((w, i) => {
+        const upperTag = weldTagNumbers[i].toUpperCase();
+        return {
+          tagNumber: weldTagNumbers[i],
+          spoolNo: weldCorrectionByTag.get(upperTag)?.newSpoolNo ?? n(w.spool_no) ?? null,
+          weldType: n(w.weld_type) ?? null,
+          weldListId: n(w.weld_list_id) ?? null,
+          size: n(w.size) ?? null,
+        };
+      }),
+      asArray(result.dimensions).map((d, i) => ({
+        tagNumber: dimensionTagNumbers[i],
+        spoolNo: n(d.spool_no) ?? null,
+        fromRef: n(d.from_ref) ?? null,
+        toRef: n(d.to_ref) ?? null,
+      })),
+      asArray(result.weld_list).map((r) => ({ id: n(r.id) ?? "", nd: n(r.nd) ?? null, type: n(r.type) ?? null })).filter((r) => r.id)
+    );
+
+    for (const spool of asArray(result.spools)) {
       const spoolNo = n(spool.spool_no);
       if (!spoolNo) continue;
-      const fit = fitBySpool.get(spoolNo);
+      const fit = fitBySpool.get(normalizeSpoolNo(spoolNo));
       tags.push({
         tagType: "spool",
         tagNumber: spoolNo,
@@ -450,17 +553,22 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
           drawing_number,
           line_number: result.line_number,
           boundary_note: n(spool.boundary_note),
-          // Each axis is max(coordinate extent, dimension sum) WITHIN that
-          // same axis -- see the fitBySpool computation above for why the two
-          // signals are only ever combined per axis, never across axes.
-          // null when neither coordinate callouts nor axis-tagged dimensions
-          // were found for this spool at all (not enough data to size it).
-          bounding_box_mm: fit?.boundingBoxMm ?? null,
+          // Each axis is max(coordinate extent, deduplicated dimension sum)
+          // WITHIN that same axis -- see computeContainerFit's own comment
+          // for why the two signals are only ever combined per axis, never
+          // across axes. null when neither coordinate callouts nor axis-
+          // tagged dimensions were found for this spool at all (not enough
+          // data to size it).
+          bounding_box_mm: fit ? [fit.boundingBoxMm.E, fit.boundingBoxMm.N, fit.boundingBoxMm.EL] : null,
           // The single largest per-axis dimension total, for reference/audit
           // -- not itself a spool dimension (that's bounding_box_mm), just
           // shows the biggest run-length signal that went into computing it.
           summed_length_mm: fit?.summedLengthMm ?? null,
           shipping_container: fit?.container ?? null,
+          // Which axis to lay along the container's length/width/height for
+          // the best (max-min-clearance) fit -- null when oversized.
+          container_orientation: fit?.orientation ?? null,
+          boundary_flag: spoolFlags.get(spoolNo) ?? null,
         },
       });
     }
@@ -469,18 +577,50 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
     // are numbered in two separate sequences that both restart at 01, so the
     // prefix is kept rather than normalized away). Falls back to a per-sheet
     // sequence number only for the rare mark with no printed tag at all.
-    (result.welds ?? []).forEach((weld, i) => {
+    asArray(result.welds).forEach((weld, i) => {
+      const tagNumber = weldTagNumbers[i];
+      const upperTag = tagNumber.toUpperCase();
+      const correction = weldCorrectionByTag.get(upperTag);
+      // weld_type is directly readable off the tag prefix itself (SW ->
+      // shop weld, FW -> field weld) whenever geometry found a matching
+      // symbol -- no ambiguity, no vision needed, so it overrides Claude's
+      // own read of the legend symbol on the rare occasion they disagree.
+      const geometricWeldType = weldTypeByGeometricTag.get(upperTag);
       tags.push({
         tagType: "weld",
-        tagNumber: n(weld.weld_tag) ?? `W${pageNumber}-${i + 1}`,
+        tagNumber,
         sourcePage: pageNumber,
         attributes: {
           drawing_number,
           line_number: result.line_number,
-          spool_no: n(weld.spool_no),
-          weld_type: n(weld.weld_type),
+          spool_no: correction?.newSpoolNo ?? n(weld.spool_no),
+          spool_no_corrected_from: correction?.oldSpoolNo ?? null,
+          weld_type: geometricWeldType && geometricWeldType !== "unknown" ? geometricWeldType : n(weld.weld_type),
           size: n(weld.size),
+          weld_list_id: n(weld.weld_list_id),
           location_note: n(weld.location_note),
+          geometry_flag: weldHardFlagByTag.get(upperTag) ?? null,
+          geometry_group_flag: weldGroupFlagByTag.get(upperTag) ?? null,
+          weld_list_flag: weldListFlags.get(tagNumber) ?? null,
+        },
+      });
+    });
+
+    // This sheet's own printed WELD LIST table, captured verbatim so a
+    // weld's own weld_list_id citation can be cross-checked against what
+    // that row actually says (see weld_list_flag above), not just trusted.
+    asArray(result.weld_list).forEach((row, i) => {
+      const rowId = n(row.id) ?? `WLR${pageNumber}-${i + 1}`;
+      tags.push({
+        tagType: "weld_list_row",
+        tagNumber: rowId,
+        sourcePage: pageNumber,
+        attributes: {
+          drawing_number,
+          line_number: result.line_number,
+          nd: n(row.nd),
+          type: n(row.type),
+          category: n(row.category),
         },
       });
     });
@@ -489,7 +629,7 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
     // own tags (not just used transiently) so a wrong bounding_box_mm/
     // summed_length_mm can be traced back to the exact points/dimensions
     // that produced it, instead of having to be inferred after the fact.
-    (result.route_points ?? []).forEach((p, i) => {
+    asArray(result.route_points).forEach((p, i) => {
       tags.push({
         tagType: "route_point",
         tagNumber: `RP${pageNumber}-${i + 1}`,
@@ -505,10 +645,11 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
         },
       });
     });
-    (result.dimensions ?? []).forEach((d, i) => {
+    asArray(result.dimensions).forEach((d, i) => {
+      const tagNumber = dimensionTagNumbers[i];
       tags.push({
         tagType: "dimension",
-        tagNumber: `DIM${pageNumber}-${i + 1}`,
+        tagNumber,
         sourcePage: pageNumber,
         attributes: {
           drawing_number,
@@ -518,6 +659,32 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
           axis: n(d.axis),
           from_ref: n(d.from_ref),
           to_ref: n(d.to_ref),
+          spool_flag: dimensionFlags.get(tagNumber) ?? null,
+        },
+      });
+    });
+
+    // Fabrication/cut sheet's own CUT PIPE LENGTH table, if this sheet has
+    // one -- the raw pipe stock a spool is built FROM, not the same thing as
+    // a route dimension (which measures the assembled spool). spool_no is
+    // frequently blank (see the schema field's own comment) since this
+    // table is usually printed once for the whole sheet, not per spool.
+    asArray(result.cut_pieces).forEach((p, i) => {
+      tags.push({
+        tagType: "cut_piece",
+        tagNumber: cutPieceTagNumbers[i],
+        sourcePage: pageNumber,
+        attributes: {
+          drawing_number,
+          line_number: result.line_number,
+          spool_no: n(p.spool_no),
+          cut_length_mm: n(p.cut_length_mm),
+          size: n(p.size),
+          remarks: n(p.remarks),
+          end1: n(p.end1),
+          end2: n(p.end2),
+          from_ref: n(p.from_ref),
+          to_ref: n(p.to_ref),
         },
       });
     });

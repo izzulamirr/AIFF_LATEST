@@ -29,8 +29,15 @@ export async function callTool<T = unknown>(
     max_tokens: opts.maxTokens,
     output_config: { effort: "high" },
     ...(opts.useThinking ? { thinking: { type: "adaptive" as const } } : {}),
-    system: opts.systemPrompt,
-    tools: [opts.tool],
+    // Cache breakpoints on the tool schema and system prompt -- both are
+    // byte-identical across every call that reuses the SAME tool (a retry of
+    // this exact call, or the same tool called again for another sheet of a
+    // multi-sheet document), so a cache hit skips paying full price for that
+    // portion again. Does NOT help across the locate/sheet/spool-tracking
+    // calls for one sheet, since each uses a different tool and therefore a
+    // different prefix -- caching only pays off on a repeat of the SAME tool.
+    system: [{ type: "text" as const, text: opts.systemPrompt, cache_control: { type: "ephemeral" as const } }],
+    tools: [{ ...opts.tool, cache_control: { type: "ephemeral" as const } }],
     tool_choice: { type: "tool", name: opts.tool.name },
     messages: [{ role: "user", content }],
   });
