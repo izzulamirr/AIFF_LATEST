@@ -1,9 +1,64 @@
 import Link from "next/link";
-import { Fragment } from "react";
+import { Fragment, type ReactNode } from "react";
 import { eq } from "drizzle-orm";
 import { documents, extractedTags } from "@easy/db";
 import { getDb } from "@/lib/db";
-import { buildSpoolingView, type DimensionRefKind } from "@/lib/verifyIso";
+import { buildSpoolingView, type DimensionRefKind, type ItemCitation } from "@/lib/verifyIso";
+
+// Renders free text (a weld's location_note, a dimension's from_ref/to_ref)
+// with any BOM item citations inside it ("F12", "item 4") underlined and
+// annotated -- hover to see what that item actually is. A citation with no
+// bomItem match (the drawing names an item this sheet's own BOM never
+// captured) gets a distinct, warning-toned underline instead of a neutral
+// one, since that gap is itself worth noticing, not just the lookup.
+function renderTextWithItemRefs(text: string, citations: ItemCitation[]) {
+  if (citations.length === 0) return text;
+  const nodes: ReactNode[] = [];
+  let cursor = 0;
+  citations.forEach((c, i) => {
+    if (c.start > cursor) nodes.push(text.slice(cursor, c.start));
+    const title = c.ambiguous
+      ? `Item ${c.itemNo} is ambiguous -- this sheet's own BOM has more than one row sharing this number (e.g. "${c.bomItem?.componentType ?? "?"}" shown, but not the only match) -- likely a BOM numbering error worth checking`
+      : c.bomItem
+        ? `${c.bomItem.componentType ?? "Item"} ${c.itemNo}: ${[c.bomItem.description, c.bomItem.size, c.bomItem.material].filter(Boolean).join(", ") || "(no further BOM detail)"}`
+        : `Item ${c.itemNo} cited here but not found in this sheet's own BOM`;
+    nodes.push(
+      <span
+        key={i}
+        title={title}
+        className={
+          c.ambiguous
+            ? "underline decoration-wavy decoration-red-500 dark:decoration-red-400"
+            : c.bomItem
+              ? "underline decoration-dotted decoration-gray-400 dark:decoration-gray-500"
+              : "underline decoration-wavy decoration-amber-500 dark:decoration-amber-400"
+        }
+      >
+        {c.raw}
+      </span>
+    );
+    cursor = c.end;
+  });
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return nodes;
+}
+
+// A gasket cited with no flange cited alongside it in the same note --
+// confirmed real case, item 7's own joint (see gasketWithoutFlange's own
+// comment in verifyIso.ts). Text-only signal, not a confirmed read of the
+// drawing: the printed balloon really may be missing, or the flange just
+// wasn't captured in THIS particular note -- worth a look either way, not
+// a certain finding.
+function GasketWithoutFlangeBadge() {
+  return (
+    <span
+      className="ml-1 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-800 dark:bg-amber-900/50 dark:text-amber-300"
+      title="A gasket is cited here with no flange cited alongside it -- the drawing's own item balloon for the matching flange may be missing, or it just wasn't captured in this note. Worth checking against the drawing."
+    >
+      &#9888; gasket, no flange cited
+    </span>
+  );
+}
 
 // One overall category per dimension row. "valve" -- a valve has a genuine
 // face-to-face body length, so a dimension reaching one stops at its flange
@@ -151,21 +206,13 @@ export default async function SpoolingPage({ params }: { params: Promise<{ id: s
                                         )}
                                       </td>
                                       <td className="text-xs text-gray-600 dark:text-gray-300">
-                                        {w.locationNote}
+                                        {renderTextWithItemRefs(w.locationNote, w.itemCitations)}
                                         {w.spoolNoCorrectedFrom && (
                                           <span
                                             className="ml-1 rounded bg-green-100 px-1.5 py-0.5 text-xs text-green-800 dark:bg-green-900/50 dark:text-green-300"
                                             title={`Auto-corrected by deterministic geometry check -- was spool_no "${w.spoolNoCorrectedFrom}"`}
                                           >
                                             &#10003; geometry-corrected (was &quot;{w.spoolNoCorrectedFrom}&quot;)
-                                          </span>
-                                        )}
-                                        {w.locationNoteCorrectedFrom && (
-                                          <span
-                                            className="ml-1 rounded bg-green-100 px-1.5 py-0.5 text-xs text-green-800 dark:bg-green-900/50 dark:text-green-300"
-                                            title={`Manually confirmed against the drawing -- was: "${w.locationNoteCorrectedFrom}"`}
-                                          >
-                                            &#10003; description corrected
                                           </span>
                                         )}
                                         {w.geometryFlag && (
@@ -176,6 +223,11 @@ export default async function SpoolingPage({ params }: { params: Promise<{ id: s
                                         {!w.geometryFlag && w.geometryGroupFlag && (
                                           <span className="ml-1 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800 dark:bg-amber-900/50 dark:text-amber-300" title={w.geometryGroupFlag}>
                                             &#9888; geometry: same unbroken run as a different spool_no
+                                          </span>
+                                        )}
+                                        {w.sizeFlag && (
+                                          <span className="ml-1 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800 dark:bg-amber-900/50 dark:text-amber-300" title={w.sizeFlag}>
+                                            &#9888; same size as reducing-branch neighbor
                                           </span>
                                         )}
                                       </td>
@@ -217,8 +269,12 @@ export default async function SpoolingPage({ params }: { params: Promise<{ id: s
                                                     </span>
                                                   )}
                                                 </td>
-                                                <td className="pr-2 text-gray-500 dark:text-gray-400">{d.fromRef ?? "-"}</td>
-                                                <td className="text-gray-500 dark:text-gray-400">{d.toRef ?? "-"}</td>
+                                                <td className="pr-2 text-gray-500 dark:text-gray-400">
+                                                  {d.fromRef ? renderTextWithItemRefs(d.fromRef, d.fromRefCitations) : "-"}
+                                                </td>
+                                                <td className="text-gray-500 dark:text-gray-400">
+                                                  {d.toRef ? renderTextWithItemRefs(d.toRef, d.toRefCitations) : "-"}
+                                                </td>
                                               </tr>
                                             );
                                           })}
@@ -264,7 +320,7 @@ export default async function SpoolingPage({ params }: { params: Promise<{ id: s
                             <td className="py-1 pr-2 font-mono text-xs text-blue-600">{w.tagNumber}</td>
                             <td className="pr-2 text-xs capitalize text-gray-500 dark:text-gray-400">{w.weldType}</td>
                             <td className="pr-2 text-xs text-gray-500 dark:text-gray-400">{w.size ?? "-"}</td>
-                            <td className="text-xs text-gray-600 dark:text-gray-300">{w.locationNote}</td>
+                            <td className="text-xs text-gray-600 dark:text-gray-300">{renderTextWithItemRefs(w.locationNote, w.itemCitations)}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -290,8 +346,10 @@ export default async function SpoolingPage({ params }: { params: Promise<{ id: s
                             <td className="py-1 pr-2 font-mono text-xs">{d.tagNumber}</td>
                             <td className="pr-2 text-xs">{d.valueMm ?? "-"}</td>
                             <td className="pr-2 text-xs">{d.axis ?? "-"}</td>
-                            <td className="pr-2 text-xs text-gray-500 dark:text-gray-400">{d.fromRef ?? "-"}</td>
-                            <td className="text-xs text-gray-500 dark:text-gray-400">{d.toRef ?? "-"}</td>
+                            <td className="pr-2 text-xs text-gray-500 dark:text-gray-400">
+                              {d.fromRef ? renderTextWithItemRefs(d.fromRef, d.fromRefCitations) : "-"}
+                            </td>
+                            <td className="text-xs text-gray-500 dark:text-gray-400">{d.toRef ? renderTextWithItemRefs(d.toRef, d.toRefCitations) : "-"}</td>
                           </tr>
                         ))}
                       </tbody>

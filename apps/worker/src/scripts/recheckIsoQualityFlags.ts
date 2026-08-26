@@ -82,6 +82,7 @@ async function main() {
         weldType: typeof a.weld_type === "string" ? a.weld_type : null,
         weldListId: typeof a.weld_list_id === "string" ? a.weld_list_id : null,
         size: typeof a.size === "string" ? a.size : null,
+        locationNote: typeof a.location_note === "string" ? a.location_note : null,
       };
     });
     const dimensionsInput: IsoQualityDimension[] = pageDimensions.map((t) => {
@@ -102,7 +103,7 @@ async function main() {
       };
     });
 
-    const { spoolFlags, dimensionFlags, weldListFlags } = computeIsoQualityFlags(spoolsInput, weldsInput, dimensionsInput, weldListRowsInput);
+    const { spoolFlags, dimensionFlags, weldListFlags, weldSizeFlags } = computeIsoQualityFlags(spoolsInput, weldsInput, dimensionsInput, weldListRowsInput);
     // Empty on purpose -- only here so any location_flag a prior run of the
     // now-retired flange-cluster check left on a weld gets cleared below.
     const retiredWeldFlags = new Map<string, string>();
@@ -186,6 +187,7 @@ async function main() {
       [pageSpools, spoolFlags, "boundary_flag"],
       [pageWelds, retiredWeldFlags, "location_flag"],
       [pageWelds, weldListFlags, "weld_list_flag"],
+      [pageWelds, weldSizeFlags, "size_flag"],
       [pageDimensions, dimensionFlags, "spool_flag"],
     ] as const) {
       for (const t of rows) {

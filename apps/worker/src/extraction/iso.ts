@@ -15,7 +15,7 @@ import { renderPdfPages, renderPdfPageTiles } from "../pdfImages";
 import { extractPageTextPositions, extractPageVectorSegments, type TextPosition, type VectorSegment } from "../pdfVectorGeometry";
 import { classifyPageShapes, computeBoundedGroups, computeWeldSpoolCorrections } from "../pdfShapeClassification";
 import { normalizeCellValue } from "./pll";
-import { computeIsoQualityFlags } from "./isoQualityChecks";
+import { computeIsoQualityFlags, boundaryNoteTreatsValveAsPassThrough } from "./isoQualityChecks";
 import { computeContainerFit, normalizeSpoolNo } from "./containerFit";
 import type { DocTypeExtractor, TagDraft } from "./types";
 
@@ -288,7 +288,7 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
       `The REMAINING ${sheetTiles.length} images are overlapping close-up tiles of that same sheet, in reading order (row 1 left to right, then row 2), each covering about a ${sheetTiles[0]?.cols ?? 3}x${sheetTiles[0]?.rows ?? 2} slice of it at far higher resolution than the whole-sheet image. ` +
       `Weld tag numbers (SW/FW + digits), E/N/EL coordinate callouts, and printed dimension values are frequently ONLY legible in the tiles -- the whole-sheet image compresses them to a few pixels. Read every weld tag, coordinate, and dimension from the tiles; use the whole-sheet image only to work out spool boundaries and how the route connects. Adjacent tiles OVERLAP, so a mark appearing in two tiles is ONE mark -- do not record it twice. `;
 
-    const spoolWeldsResult = await callWithRetry(async () => {
+    let spoolWeldsResult = await callWithRetry(async () => {
       const r = await callTool<IsoSpoolWeldsResult>(client, {
         tool: ISO_SPOOL_WELDS_TOOL,
         systemPrompt: SYSTEM_PROMPT,
@@ -304,15 +304,74 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
       // the arrays actually came back AS ARRAYS rather than trusting the
       // schema alone (confirmed on a real run: a 3-spool fabrication sheet
       // came back with spools as a bare object under output-token
-      // pressure). Fails the sheet outright on a miss rather than
-      // retrying -- a retry re-sends the full image/tile payload and pays
-      // for it again, and this can happen on every sheet of a document.
+      // pressure). One retry only, not the old blanket 2 -- a retry
+      // re-sends the full image/tile payload and pays for it again, so
+      // this is narrowly for "the response was structurally broken"
+      // (confirmed real case: ALL THREE required arrays missing at once,
+      // not just one dropped field), not a general safety net. Zero
+      // retries here meant a single output-token hiccup failed the whole
+      // document outright with no chance to self-heal; one retry catches
+      // that at a bounded, known cost instead.
       const missing = (["spools", "welds", "weld_list"] as const).filter((k) => !Array.isArray(r[k]));
       if (missing.length > 0) {
         throw new Error(`record_iso_spool_welds for ${sheet.drawing_number} sheet ${sheet.sheet ?? "?"} is missing required array field(s): ${missing.join(", ")}`);
       }
       return r;
-    }, 0);
+    }, 1);
+
+    // Self-correction loop -- confirmed real case: a fresh extraction of a
+    // document already corrected once this session walked straight through
+    // a valve and a spectacle-blind boundary, pulling 3 welds (and, via
+    // spool_no inheritance, every dimension touching them) into the wrong
+    // spool. boundaryNoteTreatsValveAsPassThrough (isoQualityChecks.ts) can
+    // catch this from the model's OWN boundary_note text, but historically
+    // only surfaced it as a flag for a human to read well after the fact --
+    // by then record_iso_route_dimensions has already run against the WRONG
+    // spool/weld reference text, so the error has already cascaded. Running
+    // the same check here, before that reference text is built, catches it
+    // while this sheet's own context is still live and lets ONE targeted
+    // re-ask fix the boundary before anything downstream inherits it. Only
+    // fires when the check actually finds this specific problem -- it costs
+    // nothing on the large majority of sheets where it doesn't apply, and
+    // does not retry on a malformed correction response (same reasoning as
+    // every other call in this file: a retry re-sends the full image/tile
+    // payload and pays for it again).
+    const boundaryPassThroughSpools = spoolWeldsResult.spools.filter((s) => boundaryNoteTreatsValveAsPassThrough(s.boundary_note ?? null));
+    if (boundaryPassThroughSpools.length > 0) {
+      try {
+        const corrected = await callWithRetry(async () => {
+          const r = await callTool<IsoSpoolWeldsResult>(client, {
+            tool: ISO_SPOOL_WELDS_TOOL,
+            systemPrompt: SYSTEM_PROMPT,
+            userText:
+              `${sheetText}\n\n${tileExplanation}` +
+              `You already read this sheet's spools and welds once via record_iso_spool_welds -- here is exactly what you returned:\n\nSPOOLS:\n${JSON.stringify(spoolWeldsResult.spools)}\n\nWELDS:\n${JSON.stringify(spoolWeldsResult.welds)}\n\n` +
+              boundaryPassThroughSpools
+                .map(
+                  (s) =>
+                    `Spool ${s.spool_no}'s own boundary_note ("${s.boundary_note}") describes the main run continuing THROUGH a valve to a later boundary -- per this tool's own rule, a valve is ALWAYS a boundary, never a mid-spool component. This spool's real boundary is the valve itself, not wherever the run continues to after it.`
+                )
+                .join("\n") +
+              `\n\nRe-derive the boundary for ${boundaryPassThroughSpools.length === 1 ? "this spool" : "these spools"} so it stops at the valve, and reassign spool_no for any welds you originally placed here that actually belong on the far side of the valve -- they may belong to an already-existing spool in the list above, or may need a new spool number if the far side doesn't have one yet (follow the same numbering convention already used on this sheet). Leave every other spool and weld exactly as you already recorded them. ` +
+              `Return the FULL corrected spools and welds arrays via record_iso_spool_welds again -- every spool and every weld on this sheet, not just the ones that changed.`,
+            maxTokens: 48000,
+            useThinking: true,
+            ...sheetImageArgs,
+          });
+          const missing = (["spools", "welds", "weld_list"] as const).filter((k) => !Array.isArray(r[k]));
+          if (missing.length > 0) {
+            throw new Error(`boundary self-correction for ${sheet.drawing_number} sheet ${sheet.sheet ?? "?"} is missing required array field(s): ${missing.join(", ")}`);
+          }
+          return r;
+        }, 1);
+        spoolWeldsResult = corrected;
+      } catch (err) {
+        // A failed correction must never fail the sheet -- proceed with the
+        // original (flagged) result; computeIsoQualityFlags still surfaces
+        // it downstream for a human, same as before this loop existed.
+        console.error(`[iso] boundary self-correction failed for ${sheet.drawing_number} sheet ${sheet.sheet ?? "?"}, keeping original result:`, err);
+      }
+    }
 
     // Reference text for the second call -- see ISO_ROUTE_DIMENSIONS_TOOL's
     // own comment for why it must use this rather than re-deriving spool
@@ -337,13 +396,13 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
       });
       // Same array-shape check as record_iso_spool_welds above, not just
       // presence -- see that call's own comment for the real case that
-      // motivated this.
+      // motivated this, and for why this is one retry, not zero.
       const missing = (["route_points", "dimensions", "cut_pieces"] as const).filter((k) => !Array.isArray(r[k]));
       if (missing.length > 0) {
         throw new Error(`record_iso_route_dimensions for ${sheet.drawing_number} sheet ${sheet.sheet ?? "?"} is missing required array field(s): ${missing.join(", ")}`);
       }
       return r;
-    }, 0);
+    }, 1);
 
     const spoolResult: IsoSpoolTrackingResult = { ...spoolWeldsResult, ...routeDimResult };
 
@@ -518,7 +577,7 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
     // same logic can be re-run against data already sitting in the database
     // -- no new extraction -- if these checks are ever updated after the
     // fact (see that function's own comment for why that matters).
-    const { spoolFlags, dimensionFlags, weldListFlags } = computeIsoQualityFlags(
+    const { spoolFlags, dimensionFlags, weldListFlags, weldSizeFlags } = computeIsoQualityFlags(
       asArray(result.spools)
         .map((s) => ({ tagNumber: n(s.spool_no) ?? "", boundaryNote: n(s.boundary_note) ?? null }))
         .filter((s) => s.tagNumber),
@@ -530,6 +589,7 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
           weldType: n(w.weld_type) ?? null,
           weldListId: n(w.weld_list_id) ?? null,
           size: n(w.size) ?? null,
+          locationNote: n(w.location_note) ?? null,
         };
       }),
       asArray(result.dimensions).map((d, i) => ({
@@ -602,6 +662,7 @@ export const extractIsoDocument: DocTypeExtractor = async (pages, apiKey, onProg
           geometry_flag: weldHardFlagByTag.get(upperTag) ?? null,
           geometry_group_flag: weldGroupFlagByTag.get(upperTag) ?? null,
           weld_list_flag: weldListFlags.get(tagNumber) ?? null,
+          size_flag: weldSizeFlags.get(tagNumber) ?? null,
         },
       });
     });

@@ -20,6 +20,7 @@ export interface IsoQualityWeld {
   weldType: string | null;
   weldListId: string | null;
   size: string | null;
+  locationNote: string | null;
 }
 export interface IsoQualityDimension {
   tagNumber: string;
@@ -37,6 +38,25 @@ export interface IsoQualityFlags {
   spoolFlags: Map<string, string>;
   dimensionFlags: Map<string, string>;
   weldListFlags: Map<string, string>;
+  weldSizeFlags: Map<string, string>;
+}
+
+// A reducing weldolet/tee cited by 2+ welds' own location_note almost always
+// has those welds split across its two different sizes (main run vs. the
+// smaller branch) -- confirmed real case: two welds both described as
+// sitting at the same "item 2 weldolet" (a printed 200x80NS reducing
+// weldolet) came back with the SAME size (200 for both), when the second
+// one is actually welded onto the weldolet's own branch outlet (80mm), not
+// the main run -- see the size field's own prompt comment (packages/
+// extraction-schemas/src/iso.ts) for the full case this rule was added for.
+// All welds reporting the identical size at a shared reducing-item citation
+// is itself the red flag; it does not require knowing which one is really
+// which side, only that at least one of them almost certainly isn't what
+// it says.
+function reducingBranchItemIn(locationNote: string | null): string | null {
+  if (!locationNote) return null;
+  const m = /\bitem\s*0*(\d+)\s*\(?\s*(?:weldolet|tee)\b/i.exec(locationNote);
+  return m ? m[1] : null;
 }
 
 // Requires BOTH a "branch leg(s)" mention AND boundary language ("bound"/
@@ -62,7 +82,13 @@ function boundaryNoteLooksBranchBased(note: string | null): boolean {
 // branch-leg check, this doesn't need a second qualifying condition -- there
 // is no legitimate reading of "the run passes through a valve" that isn't
 // this exact error, since the domain rule has no exception for it.
-function boundaryNoteTreatsValveAsPassThrough(note: string | null): boolean {
+// Exported (not just used internally by computeIsoQualityFlags below) so
+// extractIsoDocument (iso.ts) can run this SAME check immediately after
+// record_iso_spool_welds returns, while the sheet's own context is still
+// live, and trigger a targeted self-correction call rather than only
+// surfacing this as a flag for a human to read after the fact -- see
+// iso.ts's own comment on that loop for why.
+export function boundaryNoteTreatsValveAsPassThrough(note: string | null): boolean {
   if (!note) return false;
   return /\bthrough\b[^.]{0,60}\bvalves?\b/i.test(note);
 }
@@ -164,5 +190,29 @@ export function computeIsoQualityFlags(
     }
   }
 
-  return { spoolFlags, dimensionFlags, weldListFlags };
+  // Reducing-branch size check -- see reducingBranchItemIn's own comment.
+  const weldsByReducingItem = new Map<string, IsoQualityWeld[]>();
+  for (const w of welds) {
+    const item = reducingBranchItemIn(w.locationNote);
+    if (!item) continue;
+    const group = weldsByReducingItem.get(item) ?? [];
+    group.push(w);
+    weldsByReducingItem.set(item, group);
+  }
+  const weldSizeFlags = new Map<string, string>();
+  for (const [item, group] of weldsByReducingItem) {
+    if (group.length < 2) continue;
+    const sizes = new Set(group.map((w) => w.size).filter((s): s is string => !!s));
+    if (sizes.size !== 1) continue; // already split across sizes -- no red flag
+    const [onlySize] = sizes;
+    const tags = group.map((w) => w.tagNumber).join(", ");
+    for (const w of group) {
+      weldSizeFlags.set(
+        w.tagNumber,
+        `Same size (${onlySize}) as every other weld citing "item ${item}" (${tags}) -- a reducing weldolet/tee almost always splits its nearby welds across its two different sizes (main run vs. branch), so all of them matching is a sign one weld mark may actually be on the branch side, not the main run.`
+      );
+    }
+  }
+
+  return { spoolFlags, dimensionFlags, weldListFlags, weldSizeFlags };
 }

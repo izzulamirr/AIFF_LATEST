@@ -1588,6 +1588,30 @@ export async function loadRoutingAndValveMatch(params: {
   });
 }
 
+// A resolved reference to a BOM item found inside a free-text field
+// (location_note, from_ref, to_ref) -- e.g. "F12 G23 B11" or "item 4" cite
+// BOM item numbers as landmarks, but until now that was just opaque text a
+// reviewer had to look up by hand. This links each citation back to its
+// actual bom_item tag on the SAME sheet (BOM items are recorded per-page,
+// same as everything else), and null bomItem is itself a real signal --
+// the drawing cites an item this sheet's own BOM never captured, either a
+// missed BOM row or a misread item number.
+export interface ItemCitation {
+  start: number;
+  end: number;
+  raw: string; // exact matched substring, e.g. "F12", "item 4"
+  itemNo: string; // normalized bare number, e.g. "12"
+  bomItem: { description: string | null; componentType: string | null; size: string | null; material: string | null } | null;
+  // True when this sheet's own BOM has MORE than one row sharing this same
+  // item_no -- confirmed real case on a live document: item "13" appeared
+  // twice on the same sheet (a gate valve AND an unrelated gasket), so a
+  // "gate valve item 13" citation would silently resolve to whichever BOM
+  // row happened to load last, wrong more than half the time. bomItem is
+  // just the FIRST of the colliding rows here, not a confident match --
+  // the UI must treat this differently from a clean single match.
+  ambiguous: boolean;
+}
+
 export interface SpoolWeldDetail {
   tagNumber: string;
   weldType: string;
@@ -1601,6 +1625,12 @@ export interface SpoolWeldDetail {
   // with what was recorded for the weld itself (size/shop-vs-field), a sign
   // one of the two readings is wrong. No vision, no API cost.
   weldListFlag: string | null;
+  // Deterministic cross-check (apps/worker/src/extraction/isoQualityChecks.ts)
+  // -- set when this weld reports the SAME size as every other weld citing
+  // the same reducing weldolet/tee item, which almost always means one of
+  // them is actually on the branch side, not the main run. No vision, no
+  // API cost.
+  sizeFlag: string | null;
   locationNote: string;
   // Deterministic geometric cross-check (apps/worker/src/scripts/
   // applyGeometricWeldFlags.ts) -- set when this weld's leader line, traced
@@ -1629,6 +1659,12 @@ export interface SpoolWeldDetail {
   // real text layer (vector glyph outlines only, same limitation as most
   // dimension values) so geometry can't verify these on its own yet.
   locationNoteCorrectedFrom: string | null;
+  // Item-balloon codes ("F12", "G23", "B11") or bare "item N" mentions found
+  // in locationNote, resolved against this weld's own sheet BOM -- see
+  // ItemCitation's own comment.
+  itemCitations: ItemCitation[];
+  // See gasketWithoutFlange's own comment.
+  gasketWithoutFlange: boolean;
 }
 
 export interface ContainerOrientationLeg {
@@ -1706,6 +1742,17 @@ export interface DimensionRow {
   // sheet, but confirmed wrong here specifically, where BW06 is naming the
   // general area the valve sits in, not this dimension's own endpoint.
   manualKind: "weldolet" | "pipe" | "valve" | null;
+  // Item-balloon codes / bare "item N" mentions in fromRef and toRef,
+  // resolved against this dimension's own sheet BOM -- see ItemCitation's
+  // own comment. Kept separate per end so the UI can annotate each column
+  // independently.
+  fromRefCitations: ItemCitation[];
+  toRefCitations: ItemCitation[];
+  // See gasketWithoutFlange's own comment. Checked across BOTH ends
+  // combined -- a dimension's own from/to pair together describes one
+  // joint's worth of context, so a flange cited on one side still counts
+  // as covering a gasket cited on the other.
+  gasketWithoutFlange: boolean;
 }
 
 // A fabrication/cut sheet's own printed CUT PIPE LENGTH table -- the raw
@@ -1885,6 +1932,113 @@ function refMatchesEnd(weldTag: string | null, weldLocationNote: string | null, 
   const dimCoords = coordTokensIn(dimEndText);
   return weldCoords.some((c) => dimCoords.includes(c));
 }
+// Same verified-connection signal as refMatchesEnd (a shared weld tag or a
+// shared printed coordinate), applied dimension-end to dimension-end rather
+// than weld to dimension-end -- this is what lets two dimensions be
+// recognized as continuing from the same physical joint.
+function refsShareJoint(a: string | null, b: string | null): boolean {
+  if (!a || !b) return false;
+  const aTags = weldTagsIn(a);
+  if (aTags.length > 0 && aTags.some((t) => weldTagsIn(b).includes(t))) return true;
+  const aCoords = coordTokensIn(a);
+  return aCoords.length > 0 && aCoords.some((c) => coordTokensIn(b).includes(c));
+}
+// Chains consecutive dimensions end-to-end when no single printed dimension
+// spans a cut piece's own two bounding welds, but a SEQUENCE of them does --
+// confirmed real case: a piece needed 3 dimensions chained together (elbow
+// -> a branch weld -> a weldolet -> the far flange), no single dimension
+// covering the whole span, previously requiring a manual override each time
+// this shape came up. Only links two dimensions via the SAME verified
+// signal refMatchesEnd already uses (a shared weld tag or printed
+// coordinate) -- never a fuzzy text/phrase match, since two dimensions
+// merely using similar wording is not proof they share a physical joint.
+// Bounded search depth and stops at the FIRST (shortest) chain found each
+// hop, since a longer alternate path through unrelated dimensions is far
+// more likely to be a coincidental token overlap than the real physical
+// route.
+const MAX_CHAIN_HOPS = 4;
+function findDimensionChain(
+  pFromTag: string | null,
+  pFromLoc: string | null,
+  pToTag: string | null,
+  pToLoc: string | null,
+  pool: DimensionRow[]
+): DimensionRow[] | null {
+  type ChainState = { chain: DimensionRow[]; endRef: string | null };
+  let frontier: ChainState[] = [];
+  for (const d of pool) {
+    if (!d.valueMm) continue;
+    if (refMatchesEnd(pFromTag, pFromLoc, d.fromRef)) frontier.push({ chain: [d], endRef: d.toRef });
+    if (refMatchesEnd(pFromTag, pFromLoc, d.toRef)) frontier.push({ chain: [d], endRef: d.fromRef });
+  }
+  for (let hop = 1; hop <= MAX_CHAIN_HOPS; hop++) {
+    const reached = frontier.find((s) => refMatchesEnd(pToTag, pToLoc, s.endRef));
+    if (reached) return reached.chain;
+    if (hop === MAX_CHAIN_HOPS) break;
+    const next: ChainState[] = [];
+    for (const state of frontier) {
+      const used = new Set(state.chain.map((d) => d.tagNumber));
+      for (const d of pool) {
+        if (!d.valueMm || used.has(d.tagNumber)) continue;
+        if (refsShareJoint(state.endRef, d.fromRef)) next.push({ chain: [...state.chain, d], endRef: d.toRef });
+        else if (refsShareJoint(state.endRef, d.toRef)) next.push({ chain: [...state.chain, d], endRef: d.fromRef });
+      }
+    }
+    frontier = next;
+  }
+  return null;
+}
+
+// Finds item-balloon citations in a free-text field and resolves each one
+// against the given sheet's own BOM (item_no -> bom_item lookup, already
+// scoped to the right page by the caller). Two citation shapes: "F12"/
+// "G23"/"B11" (a single letter -- Flange/Gasket/Bolt -- immediately
+// followed by the item number, the printed convention for a joint's own
+// hardware trio) and bare "item 12". Both normalize to the same bare
+// item_no for lookup. Overlapping matches are deduped, first match wins
+// (the two patterns can't legitimately overlap on real text, but a
+// malformed string shouldn't produce garbled overlapping spans).
+function findItemCitations(text: string | null, bomByItemNo: Map<string, NonNullable<ItemCitation["bomItem"]>[]>): ItemCitation[] {
+  if (!text) return [];
+  function resolve(itemNo: string): Pick<ItemCitation, "bomItem" | "ambiguous"> {
+    const matches = bomByItemNo.get(itemNo) ?? [];
+    return { bomItem: matches[0] ?? null, ambiguous: matches.length > 1 };
+  }
+  const raw: ItemCitation[] = [];
+  const codeRe = /\b([FGB])\s*0*(\d+)\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = codeRe.exec(text))) {
+    raw.push({ start: m.index, end: m.index + m[0].length, raw: m[0], itemNo: m[2], ...resolve(m[2]) });
+  }
+  const itemRe = /\bitem\s*0*(\d+)\b/gi;
+  while ((m = itemRe.exec(text))) {
+    raw.push({ start: m.index, end: m.index + m[0].length, raw: m[0], itemNo: m[1], ...resolve(m[1]) });
+  }
+  raw.sort((a, b) => a.start - b.start);
+  const result: ItemCitation[] = [];
+  let lastEnd = -1;
+  for (const c of raw) {
+    if (c.start < lastEnd) continue;
+    result.push(c);
+    lastEnd = c.end;
+  }
+  return result;
+}
+
+// A joint's own hardware trio (flange + gasket + bolt, "F12 G23 B11") is
+// normally cited together -- confirmed real case: this sheet cites "G9"
+// twice near item 7's valve (DIM1-6, DIM1-7) with no flange code either
+// time, unlike its other bolted joints where all three appear together
+// (e.g. "F12 G23 B11" at the spectacle blind). A gasket with no flange
+// cited alongside it in the SAME text is the printed drawing's own
+// incomplete item-balloon set showing up in the extraction -- worth a
+// human look, though this can only see what's already in the extracted
+// text, not confirm a balloon is truly absent from the drawing itself.
+function gasketWithoutFlange(citations: ItemCitation[]): boolean {
+  const hasGasket = citations.some((c) => c.bomItem?.componentType?.toUpperCase() === "GASKET");
+  const hasFlange = citations.some((c) => c.bomItem?.componentType?.toUpperCase() === "FLANGE");
+  return hasGasket && !hasFlange;
+}
 
 // Pipe spools + weld list -- straight off this ISO's own extracted tags, no
 // cross-document referencing needed. Pure function: same input always
@@ -1916,6 +2070,34 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
   // entirely now that welds/dimensions render only inside their spool's own
   // sub-table (see unassignedWelds/unassignedDimensions below).
   const existingSpoolKeys = new Set(spoolTags.map((t) => spoolNumberKey(t.tagNumber)));
+
+  // BOM items are recorded per-page, same as everything else -- item_no
+  // (e.g. "12") is only unique WITHIN one sheet's own BOM, so lookups must
+  // stay scoped by page rather than pooled across the whole document.
+  // Collects an ARRAY per item_no rather than overwriting on collision --
+  // confirmed real case: item "13" appeared twice on the same sheet (a
+  // gate valve and an unrelated gasket), which a plain overwrite would
+  // have silently resolved to whichever loaded last, wrong for any
+  // citation that actually meant the other one.
+  const bomByItemNoByPage = new Map<number, Map<string, NonNullable<ItemCitation["bomItem"]>[]>>();
+  for (const t of tags) {
+    if (t.tagType !== "bom_item") continue;
+    const page = t.sourcePage ?? 0;
+    const a = t.attributes as Record<string, unknown>;
+    const map = bomByItemNoByPage.get(page) ?? new Map<string, NonNullable<ItemCitation["bomItem"]>[]>();
+    const list = map.get(t.tagNumber.trim()) ?? [];
+    list.push({
+      description: typeof a.description === "string" ? a.description : null,
+      componentType: typeof a.component_type === "string" ? a.component_type : null,
+      size: typeof a.size === "string" ? a.size : null,
+      material: typeof a.material === "string" ? a.material : null,
+    });
+    map.set(t.tagNumber.trim(), list);
+    bomByItemNoByPage.set(page, map);
+  }
+  function bomForPage(page: number | null): Map<string, NonNullable<ItemCitation["bomItem"]>[]> {
+    return bomByItemNoByPage.get(page ?? 0) ?? new Map();
+  }
 
   // Collapses a spool's own weld tags into compact ranges (e.g. "SW01-SW06,
   // FW01") instead of listing every single one -- SW and FW are separate
@@ -1971,17 +2153,22 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
   for (const t of weldTags) {
     const a = t.attributes as Record<string, unknown>;
     const spoolNo = a.spool_no;
+    const locationNote = typeof a.location_note === "string" && a.location_note ? a.location_note : "-";
+    const weldItemCitations = findItemCitations(locationNote, bomForPage(t.sourcePage));
     const detail: SpoolWeldDetail = {
       tagNumber: t.tagNumber,
       weldType: typeof a.weld_type === "string" && a.weld_type ? a.weld_type : "-",
       size: typeof a.size === "string" && a.size ? a.size : null,
       weldListId: typeof a.weld_list_id === "string" && a.weld_list_id ? a.weld_list_id : null,
       weldListFlag: typeof a.weld_list_flag === "string" ? a.weld_list_flag : null,
-      locationNote: typeof a.location_note === "string" && a.location_note ? a.location_note : "-",
+      sizeFlag: typeof a.size_flag === "string" ? a.size_flag : null,
+      locationNote,
       geometryFlag: typeof a.geometry_flag === "string" ? a.geometry_flag : null,
       geometryGroupFlag: typeof a.geometry_group_flag === "string" ? a.geometry_group_flag : null,
       spoolNoCorrectedFrom: typeof a.spool_no_corrected_from === "string" ? a.spool_no_corrected_from : null,
       locationNoteCorrectedFrom: typeof a.location_note_corrected_from === "string" ? a.location_note_corrected_from : null,
+      itemCitations: weldItemCitations,
+      gasketWithoutFlange: gasketWithoutFlange(weldItemCitations),
     };
     if (typeof spoolNo !== "string" || !spoolNo || !existingSpoolKeys.has(spoolNumberKey(spoolNo))) {
       unassignedWelds.push(detail);
@@ -2065,6 +2252,8 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
       const fromRef = typeof a.from_ref === "string" ? a.from_ref : null;
       const toRef = typeof a.to_ref === "string" ? a.to_ref : null;
       const [fromKind, toKind] = demoteCrossEndValve(classifyDimensionRef(fromRef), classifyDimensionRef(toRef));
+      const fromRefCitations = findItemCitations(fromRef, bomForPage(t.sourcePage));
+      const toRefCitations = findItemCitations(toRef, bomForPage(t.sourcePage));
       return {
         tagNumber: t.tagNumber,
         valueMm: typeof a.value_mm === "string" ? a.value_mm : null,
@@ -2078,6 +2267,9 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
         spoolFlag: typeof a.spool_flag === "string" ? a.spool_flag : null,
         manualKind:
           a.manual_kind === "weldolet" ? "weldolet" : a.manual_kind === "pipe" ? "pipe" : a.manual_kind === "valve" ? "valve" : null,
+        fromRefCitations,
+        toRefCitations,
+        gasketWithoutFlange: gasketWithoutFlange([...fromRefCitations, ...toRefCitations]),
       };
     });
 
@@ -2165,27 +2357,49 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
       const pToLoc = weldLocationNoteByTag.get(pToTag ?? "") ?? null;
 
       // A manual override (see CutPieceRow.manualDimensionMatch) always wins
-      // over the automatic finder below -- it exists precisely for the cases
-      // the automatic tag/coordinate matching can't safely resolve on its own.
-      // "DIM1-12+DIM1-13" chains two dimensions end-to-end (no single printed
-      // dimension spans the piece, but consecutive ones together do) -- summed
-      // value, with the elbow count taken only from the chain's own two OUTER
-      // ends (the shared internal joint between chained dimensions is never a
-      // real boundary of the piece, so it must never be counted).
+      // over the automatic finder below -- it exists for the cases neither
+      // the single-dimension match NOR the auto-chain finder can safely
+      // resolve on their own. "DIM1-12+DIM1-13" chains two dimensions
+      // end-to-end (no single printed dimension spans the piece, but
+      // consecutive ones together do) -- summed value, with the elbow count
+      // taken only from the chain's own two OUTER ends (the shared internal
+      // joint between chained dimensions is never a real boundary of the
+      // piece, so it must never be counted).
       const manualTags = p.manualDimensionMatch ? p.manualDimensionMatch.split("+").map((t) => t.trim()) : null;
-      const match: Pick<DimensionRow, "tagNumber" | "valueMm" | "fromRef" | "toRef"> | undefined = manualTags
-        ? (() => {
-            const rows = manualTags.map((tag) => dimensionRows.find((d) => d.tagNumber === tag)).filter((d): d is DimensionRow => !!d);
-            if (rows.length !== manualTags.length) return undefined;
-            const sum = rows.reduce((acc, d) => acc + (d.valueMm ? Number(d.valueMm) : 0), 0);
-            return { tagNumber: manualTags.join(" + "), valueMm: String(sum), fromRef: rows[0].fromRef, toRef: rows[rows.length - 1].toRef };
-          })()
-        : dimensionRows.find((d) => {
-            if (!d.valueMm) return false;
-            const straight = refMatchesEnd(pFromTag, pFromLoc, d.fromRef) && refMatchesEnd(pToTag, pToLoc, d.toRef);
-            const reversed = refMatchesEnd(pFromTag, pFromLoc, d.toRef) && refMatchesEnd(pToTag, pToLoc, d.fromRef);
-            return straight || reversed;
-          });
+      let match: Pick<DimensionRow, "tagNumber" | "valueMm" | "fromRef" | "toRef"> | undefined;
+      let autoChainNote: string | null = null;
+      if (manualTags) {
+        const rows = manualTags.map((tag) => dimensionRows.find((d) => d.tagNumber === tag)).filter((d): d is DimensionRow => !!d);
+        if (rows.length === manualTags.length) {
+          const sum = rows.reduce((acc, d) => acc + (d.valueMm ? Number(d.valueMm) : 0), 0);
+          match = { tagNumber: manualTags.join(" + "), valueMm: String(sum), fromRef: rows[0].fromRef, toRef: rows[rows.length - 1].toRef };
+        }
+      } else {
+        match = dimensionRows.find((d) => {
+          if (!d.valueMm) return false;
+          const straight = refMatchesEnd(pFromTag, pFromLoc, d.fromRef) && refMatchesEnd(pToTag, pToLoc, d.toRef);
+          const reversed = refMatchesEnd(pFromTag, pFromLoc, d.toRef) && refMatchesEnd(pToTag, pToLoc, d.fromRef);
+          return straight || reversed;
+        });
+        if (!match) {
+          // No single dimension spans this piece -- try chaining consecutive
+          // ones together via verified shared joints (see
+          // findDimensionChain's own comment). Flagged with a note (amber
+          // tint on the page) since this is an algorithmic discovery, not a
+          // human-confirmed match like a manual override -- worth a glance,
+          // not silently treated as equally certain.
+          const chain = findDimensionChain(pFromTag, pFromLoc, pToTag, pToLoc, dimensionRows);
+          if (chain) {
+            match = {
+              tagNumber: chain.map((d) => d.tagNumber).join(" + "),
+              valueMm: String(chain.reduce((acc, d) => acc + Number(d.valueMm ?? 0), 0)),
+              fromRef: chain[0].fromRef,
+              toRef: chain[chain.length - 1].toRef,
+            };
+            autoChainNote = `Auto-chained ${chain.length} consecutive dimensions (${chain.map((d) => d.tagNumber).join(" -> ")}) via shared weld tags/coordinates -- no single printed dimension spans this piece. Worth a quick check against the drawing, same as any algorithmic match.`;
+          }
+        }
+      }
 
       if (!match || !match.valueMm) {
         return { pieceTag: p.tagNumber, cutLengthMm: Number(p.cutLengthMm), size: p.size, fromRef: p.fromRef, toRef: p.toRef, matchedDimensionTag: null, dimensionValueMm: null, remainingMm: null, elbowCount: null, perElbowMm: null, note: null };
@@ -2206,7 +2420,7 @@ export function buildSpoolingView(tags: ExtractedTag[]): SpoolingView {
         remainingMm: remaining,
         elbowCount,
         perElbowMm: elbowCount > 0 ? remaining / elbowCount : null,
-        note: p.manualDimensionNote,
+        note: p.manualDimensionNote ?? autoChainNote,
       };
     });
 
